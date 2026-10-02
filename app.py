@@ -6,15 +6,19 @@ from datetime import datetime, timedelta, date
 from pathlib import Path
 from io import BytesIO
 import base64, math, os
+from openpyxl import load_workbook
 
 import plotly.express as px
 import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # PDF/PPT
-from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.pagesizes import A4, A3, landscape
 from reportlab.lib import colors
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage, PageBreak
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -47,6 +51,7 @@ ALTA_LOGO = ASSETS / "alta_logo.png"
 DDDC_LOGO = ASSETS / "dddc_logo.png"
 DAR_LOGO = ASSETS / "dar_logo.png"
 COVER_IMG = ASSETS / "jrd_cover.png"
+DB_TEMPLATE = ROOT / "templates" / "JRD_Project_Data_Input_v1.xlsx"
 
 st.markdown(f"""
 <style>
@@ -57,33 +62,8 @@ html, body, [class*="css"] {{ font-family: Poppins, Arial, sans-serif; }}
 div[data-testid="stMetric"] {{
   border: 1px solid rgba(209,211,212,.35);
   border-left: 5px solid {BRAND_GREEN};
-  padding: 14px 16px; border-radius: 10px;
+  padding: 12px 14px; border-radius: 10px;
   background: rgba(247,247,245,.04);
-  min-height: 112px;
-  overflow: visible;
-}}
-[data-testid="stMetricLabel"] p {{
-  font-size: 0.82rem !important;
-  line-height: 1.15 !important;
-  white-space: normal !important;
-  overflow: visible !important;
-  text-overflow: clip !important;
-}}
-[data-testid="stMetricValue"] {{
-  font-size: clamp(1.55rem, 2vw, 2.15rem) !important;
-  line-height: 1.05 !important;
-  white-space: nowrap !important;
-  overflow: visible !important;
-}}
-[data-testid="stDataFrame"] {{
-  font-size: 0.9rem;
-}}
-[data-testid="stDataFrame"] [role="columnheader"] {{
-  font-weight: 700;
-}}
-@media (max-width: 1450px) {{
-  [data-testid="stMetricValue"] {{ font-size: 1.55rem !important; }}
-  [data-testid="stMetricLabel"] p {{ font-size: 0.76rem !important; }}
 }}
 .kpi-title {{font-size:.74rem; opacity:.72; text-transform:uppercase; letter-spacing:.04em;}}
 .kpi-big {{font-size:1.65rem; font-weight:700;}}
@@ -352,16 +332,21 @@ def read_any_excel(uploaded):
     except Exception:
         return {}
 
-def _is_date_like(x):
-    if pd.isna(x):
-        return False
-    if isinstance(x, (pd.Timestamp, datetime, date)):
-        return True
+def _excel_serial_date(x):
+    if pd.isna(x): return pd.NaT
+    if isinstance(x,(pd.Timestamp,datetime,date)): return pd.Timestamp(x)
     try:
-        y = pd.to_datetime(x, errors="coerce")
-        return pd.notna(y) and 1990 <= y.year <= 2050
-    except Exception:
-        return False
+        if isinstance(x,(int,float,np.integer,np.floating)) and 20000 <= float(x) <= 80000:
+            return pd.Timestamp("1899-12-30") + pd.to_timedelta(float(x), unit="D")
+    except Exception: pass
+    return pd.to_datetime(x, errors="coerce")
+
+def _mixed_dates(values):
+    return pd.Series([_excel_serial_date(v) for v in list(values)])
+
+def _is_date_like(x):
+    y=_excel_serial_date(x)
+    return pd.notna(y) and 1990 <= y.year <= 2050
 
 def parse_planned_curve_excel(uploaded, preferred=("PLANNED", "W"), default_freq="W"):
     """
@@ -402,7 +387,7 @@ def parse_planned_curve_excel(uploaded, preferred=("PLANNED", "W"), default_freq
     scored.sort(reverse=True, key=lambda x: x[0])
     _, sname, date_row, value_row, date_cols = scored[0]
     df = sheets[sname]
-    dates = pd.to_datetime(df.loc[date_row, date_cols], errors="coerce")
+    dates = _mixed_dates(df.loc[date_row, date_cols].values)
     values = pd.to_numeric(df.loc[value_row, date_cols], errors="coerce").fillna(0.0)
     out = pd.DataFrame({"date": dates.values, "planned": values.values})
     out = out.dropna(subset=["date"]).sort_values("date")
@@ -429,7 +414,7 @@ def parse_manpower_plan_excel(uploaded, monthly=False):
                 date_cols=[c for c,v in df.iloc[date_row].items() if _is_date_like(v)]
                 if len(date_cols) >= 3:
                     vals=pd.to_numeric(df.loc[r,date_cols],errors="coerce").fillna(0.0)
-                    out=pd.DataFrame({"date":pd.to_datetime(df.loc[date_row,date_cols],errors="coerce").values,
+                    out=pd.DataFrame({"date":_mixed_dates(df.loc[date_row,date_cols].values).values,
                                       "planned":vals.values})
                     out=out.dropna(subset=["date"]).sort_values("date")
                     candidates.append((len(date_cols), out))
@@ -478,6 +463,86 @@ def make_download_chart(fig, width=1200, height=620):
         return fig.to_image(format="png", width=width, height=height, scale=2)
     except Exception:
         return None
+
+
+def read_project_database(uploaded):
+    """Read the user-maintained project database workbook."""
+    if uploaded is None:
+        return {}, {}
+    try:
+        xls = pd.ExcelFile(uploaded)
+        sheets = {name: pd.read_excel(xls, sheet_name=name) for name in xls.sheet_names}
+        setup = {}
+        if "Project Setup" in sheets:
+            df = sheets["Project Setup"]
+            # locate Field/Value columns even when title rows exist
+            if "Field" in df.columns and "Value" in df.columns:
+                use = df[["Field","Value"]].dropna(subset=["Field"])
+            else:
+                raw = pd.read_excel(uploaded, sheet_name="Project Setup", header=None)
+                hdr_idx = None
+                for i in range(min(10,len(raw))):
+                    row = raw.iloc[i].astype(str).str.strip().str.lower().tolist()
+                    if "field" in row and "value" in row:
+                        hdr_idx=i; break
+                if hdr_idx is not None:
+                    df2=pd.read_excel(uploaded, sheet_name="Project Setup", header=hdr_idx)
+                    use=df2[["Field","Value"]].dropna(subset=["Field"])
+                else:
+                    use=pd.DataFrame(columns=["Field","Value"])
+            for _,r in use.iterrows():
+                setup[str(r["Field"]).strip()] = r["Value"]
+        return setup, sheets
+    except Exception:
+        return {}, {}
+
+def db_sheet(db_sheets, name, cols=None):
+    df=db_sheets.get(name, pd.DataFrame()).copy()
+    if df.empty:
+        return df
+    df=df.dropna(how="all")
+    if cols:
+        keep=[c for c in cols if c in df.columns]
+        return df[keep].copy() if keep else pd.DataFrame()
+    return df
+
+def get_setup(setup, key, default=None):
+    v=setup.get(key, default)
+    return default if pd.isna(v) else v
+
+def build_history_curves(db_sheets, data_date, current_mhr_actual=np.nan, current_cost_actual=np.nan,
+                         current_mhr_plan=np.nan, current_cost_plan=np.nan):
+    hist=db_sheet(db_sheets,"Update History")
+    cols=["Data Date","Report No.","MHR Cumulative Plan %","MHR Cumulative Actual %",
+          "Cost Cumulative Plan %","Cost Cumulative Actual %","Forecast Completion",
+          "Negative Float Activities","Notes"]
+    if hist.empty:
+        hist=pd.DataFrame(columns=cols)
+    for c in cols:
+        if c not in hist.columns: hist[c]=np.nan
+    hist=hist[cols].copy()
+    hist["Data Date"]=pd.to_datetime(hist["Data Date"],errors="coerce")
+    hist=hist.dropna(subset=["Data Date"])
+    current={
+        "Data Date":pd.Timestamp(data_date),
+        "MHR Cumulative Plan %":current_mhr_plan,
+        "MHR Cumulative Actual %":current_mhr_actual,
+        "Cost Cumulative Plan %":current_cost_plan,
+        "Cost Cumulative Actual %":current_cost_actual,
+    }
+    # replace same data date, otherwise append
+    hist=hist[hist["Data Date"].dt.normalize()!=pd.Timestamp(data_date).normalize()]
+    hist=pd.concat([hist,pd.DataFrame([current])],ignore_index=True).sort_values("Data Date")
+    for c in ["MHR Cumulative Plan %","MHR Cumulative Actual %","Cost Cumulative Plan %","Cost Cumulative Actual %"]:
+        hist[c]=pd.to_numeric(hist[c],errors="coerce")
+    for prefix in ["MHR","Cost"]:
+        ac=f"{prefix} Cumulative Actual %"; pc=f"{prefix} Cumulative Plan %"
+        hist[f"{prefix} Weekly Actual %"]=hist[ac].diff().fillna(hist[ac])
+        hist[f"{prefix} Weekly Plan %"]=hist[pc].diff().fillna(hist[pc])
+    return hist.reset_index(drop=True)
+
+def dataframe_or_message(df, message="Data not provided"):
+    return df if df is not None and not df.empty else pd.DataFrame({"Status":[message]})
 
 def style_float(v):
     if pd.isna(v): return ""
@@ -528,16 +593,19 @@ def fig_to_png(fig):
 # Sidebar inputs
 # ------------------------------------------------------------------
 st.sidebar.title("Project Controls Hub")
-st.sidebar.caption("v0.4.1 CLIENT REPORTING · JRD Executive Controls")
+st.sidebar.caption("v0.5 WPR MASTER REPORTING · JRD Project Controls")
 
-baseline_file = st.sidebar.file_uploader("1. Approved Baseline", type=["xlsx"], key="baseline")
-update_file = st.sidebar.file_uploader("2. Current Update", type=["xlsx"], key="update")
-resource_file = st.sidebar.file_uploader("3. Resource / Cost Export for Actuals", type=["xlsx"], key="resource")
+project_db_file = st.sidebar.file_uploader("1. Project Database / WPR Inputs", type=["xlsx"], key="project_db")
+if DB_TEMPLATE.exists():
+    st.sidebar.download_button("Download Project Database Template", DB_TEMPLATE.read_bytes(), "JRD_Project_Data_Input_v1.xlsx", use_container_width=True)
+baseline_file = st.sidebar.file_uploader("2. Approved Baseline", type=["xlsx"], key="baseline")
+update_file = st.sidebar.file_uploader("3. Current Update", type=["xlsx"], key="update")
+resource_file = st.sidebar.file_uploader("4. Resource / Cost Export for Actuals", type=["xlsx"], key="resource")
 
 st.sidebar.markdown("### Planned Curves")
-planned_cost_file = st.sidebar.file_uploader("4. Planned Cost / Cash Flow Excel", type=["xlsx"], key="planned_cost")
-planned_unit_file = st.sidebar.file_uploader("5. Planned Unit / MHR Excel", type=["xlsx"], key="planned_unit")
-planned_manpower_file = st.sidebar.file_uploader("6. Planned Manpower Histogram Excel", type=["xlsx"], key="planned_mph")
+planned_cost_file = st.sidebar.file_uploader("5. Planned Cost / Cash Flow Excel", type=["xlsx"], key="planned_cost")
+planned_unit_file = st.sidebar.file_uploader("6. Planned Unit / MHR Excel", type=["xlsx"], key="planned_unit")
+planned_manpower_file = st.sidebar.file_uploader("7. Planned Manpower Histogram Excel", type=["xlsx"], key="planned_mph")
 
 today_default = date.today()
 data_date_input = st.sidebar.date_input("Data Date", value=today_default, format="DD/MM/YYYY")
@@ -553,10 +621,20 @@ st.sidebar.caption("Code calculates · AI interprets")
 
 # Progress photos
 progress_photos = st.sidebar.file_uploader(
-    "4. Progress Photos",
+    "8. Progress Photos",
     type=["png","jpg","jpeg"],
     accept_multiple_files=True
 )
+
+project_setup, project_db_sheets = read_project_database(project_db_file)
+if project_setup:
+    db_dd = get_setup(project_setup, "Data Date", None)
+    if db_dd is not None and pd.notna(pd.to_datetime(db_dd,errors="coerce")):
+        data_date = pd.Timestamp(pd.to_datetime(db_dd))
+    near_tf = int(get_setup(project_setup, "Near Critical Threshold (days)", near_tf) or near_tf)
+    lookahead_weeks = int(get_setup(project_setup, "Lookahead Weeks", lookahead_weeks) or lookahead_weeks)
+    hours_per_day = float(get_setup(project_setup, "Working Hours / Day", hours_per_day) or hours_per_day)
+    days_per_week = float(get_setup(project_setup, "Working Days / Week", days_per_week) or days_per_week)
 
 # ------------------------------------------------------------------
 # Cover
@@ -566,14 +644,14 @@ if COVER_IMG.exists():
     st.markdown(f"""
     <div class="cover-card" style="height:360px;background:url('data:image/png;base64,{cb64}') center/cover;">
       <div class="cover-overlay">
-        <div class="cover-title">JUMEIRAH RETAIL DEVELOPMENT</div>
-        <div class="cover-sub">Owner / Employer: ALTA &nbsp;&nbsp; | &nbsp;&nbsp; Contractor: DDDC &nbsp;&nbsp; | &nbsp;&nbsp; Consultant: DAR</div>
+        <div class="cover-title">{str(get_setup(project_setup, "Project Name", "JUMEIRAH RETAIL DEVELOPMENT"))}</div>
+        <div class="cover-sub">Owner / Employer: {str(get_setup(project_setup, "Owner / Employer", "ALTA"))} &nbsp;&nbsp; | &nbsp;&nbsp; Contractor: {str(get_setup(project_setup, "Contractor", "DDDC"))} &nbsp;&nbsp; | &nbsp;&nbsp; Consultant: {str(get_setup(project_setup, "Consultant", "DAR"))}</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
 else:
-    st.title("JUMEIRAH RETAIL DEVELOPMENT")
-    st.caption("Owner / Employer: ALTA | Contractor: DDDC | Consultant: DAR")
+    st.title(str(get_setup(project_setup, "Project Name", "JUMEIRAH RETAIL DEVELOPMENT")))
+    st.caption(f"Owner / Employer: {get_setup(project_setup, 'Owner / Employer', 'ALTA')} | Contractor: {get_setup(project_setup, 'Contractor', 'DDDC')} | Consultant: {get_setup(project_setup, 'Consultant', 'DAR')}")
 
 if baseline_file is None:
     st.info("Upload the Approved Baseline Primavera Excel export to start.")
@@ -686,12 +764,12 @@ tabs = st.tabs([
 # ------------------------------------------------------------------
 with tabs[0]:
     st.markdown('<div class="section-title">Executive Project Summary</div>', unsafe_allow_html=True)
-    a,b = st.columns([1.15,2.35], gap="large")
+    a,b = st.columns([1,2])
     with a:
         summary = pd.DataFrame({
             "Description":["Contract Commencement","Contract Completion","Forecast Completion","Total Duration (days)",
                            "Time Elapsed (days)","Remaining Time (days)","Time Elapsed (%)","Data Date","Schedule Status"],
-            "Status":[fmt_date(bf["start"]),fmt_date(bf["finish"]),fmt_date(forecast_finish),
+            "Status":[fmt_date(pd.to_datetime(get_setup(project_setup,"Contract Commencement",bf["start"]),errors="coerce")),fmt_date(pd.to_datetime(get_setup(project_setup,"Contract Completion",bf["finish"]),errors="coerce")),fmt_date(forecast_finish),
                       int(duration_days) if pd.notna(duration_days) else None,
                       int(elapsed_days) if pd.notna(elapsed_days) else None,
                       int(remaining_days) if pd.notna(remaining_days) else None,
@@ -699,16 +777,15 @@ with tabs[0]:
                       fmt_date(data_date),
                       "Behind Programme" if pd.notna(forecast_move) and forecast_move>0 else "On / Ahead"]
         })
-        st.dataframe(summary, use_container_width=True, hide_index=True, height=390)
+        st.dataframe(summary, use_container_width=True, hide_index=True)
     with b:
-        r1=st.columns(3, gap="medium")
-        r1[0].metric("Forecast Movement", f"{forecast_move:+.0f} d" if pd.notna(forecast_move) else "—")
-        r1[1].metric("Critical Activities", f"{bf['critical']:,}")
-        r1[2].metric("Negative Float", f"{bf['negative']:,}")
-        r2=st.columns(3, gap="medium")
-        r2[0].metric("MHR Planned", f"{mhr_plan:.2f}%" if pd.notna(mhr_plan) else "N/A")
-        r2[1].metric("MHR Actual", f"{mhr_actual:.2f}%" if pd.notna(mhr_actual) else "N/A")
-        r2[2].metric("Cost Actual", f"{cost_actual:.2f}%" if pd.notna(cost_actual) else "N/A")
+        c=st.columns(6)
+        c[0].metric("Forecast Movement", f"{forecast_move:+.0f} d" if pd.notna(forecast_move) else "—")
+        c[1].metric("Critical Activities", f"{bf['critical']:,}")
+        c[2].metric("Negative Float", f"{int(((curr if curr is not None else base).total_float_days<0).sum()):,}")
+        c[3].metric("MHR Planned", f"{mhr_plan:.2f}%" if pd.notna(mhr_plan) else "N/A")
+        c[4].metric("MHR Actual", f"{mhr_actual:.2f}%" if pd.notna(mhr_actual) else "N/A")
+        c[5].metric("Cost Actual", f"{cost_actual:.2f}%" if pd.notna(cost_actual) else "N/A")
 
         # Progress summary tables
         ptab = pd.DataFrame([
@@ -720,7 +797,7 @@ with tabs[0]:
                 lambda v: f"color:{BRAND_RED};font-weight:700" if isinstance(v,(float,np.floating)) and v<0 else "",
                 subset=["Variance %"]
             ),
-            use_container_width=True, hide_index=True, height=145
+            use_container_width=True, hide_index=True
         )
 
     c1,c2=st.columns(2)
@@ -729,7 +806,7 @@ with tabs[0]:
         dd=pd.DataFrame({"Metric":["Original Duration","At Completion Duration","Time Elapsed"],
                          "Days":[duration_days, duration_days+(forecast_move if pd.notna(forecast_move) else 0), elapsed_days]})
         fig=px.bar(dd,x="Days",y="Metric",orientation="h",text="Days",title="Project Duration")
-        fig.update_layout(height=360,xaxis_title="Days",yaxis_title="", margin=dict(l=10,r=10,t=55,b=25))
+        fig.update_layout(height=320,xaxis_title="Days",yaxis_title="")
         st.plotly_chart(fig,use_container_width=True)
     with c2:
         # Management alerts
@@ -858,8 +935,21 @@ with tabs[5]:
         mp = manpower_plan_weekly.copy()
 
     actual_seed = mp[["date","planned"]].copy()
+    actual_seed["date"] = pd.to_datetime(actual_seed["date"])
     actual_seed["actual"] = 0.0
-    actual_seed["date"] = pd.to_datetime(actual_seed["date"]).dt.date
+    db_mp = db_sheet(project_db_sheets, "Actual Manpower")
+    if not db_mp.empty and "Date" in db_mp.columns:
+        db_mp["Date"] = pd.to_datetime(db_mp["Date"], errors="coerce")
+        if "Total" not in db_mp.columns:
+            parts=[c for c in ["Staff","Civil","MEP","Finishes","Subcontractors"] if c in db_mp.columns]
+            if parts:
+                db_mp["Total"] = db_mp[parts].apply(pd.to_numeric,errors="coerce").fillna(0).sum(axis=1)
+        db_mp["Total"] = pd.to_numeric(db_mp.get("Total"), errors="coerce")
+        db_week = db_mp.dropna(subset=["Date"]).set_index("Date")["Total"].resample("W").mean().reset_index().rename(columns={"Date":"date","Total":"actual_db"})
+        actual_seed = pd.merge(actual_seed, db_week, on="date", how="left")
+        actual_seed["actual"] = actual_seed["actual_db"].fillna(0.0)
+        actual_seed = actual_seed.drop(columns=["actual_db"])
+    actual_seed["date"] = actual_seed["date"].dt.date
     st.markdown("### Actual Manpower Input from Timesheet")
     edited = st.data_editor(
         actual_seed,
@@ -977,286 +1067,551 @@ with tabs[10]:
 # ------------------------------------------------------------------
 # Report generators
 # ------------------------------------------------------------------
-def make_pdf():
-    buf=BytesIO()
-    doc=SimpleDocTemplate(buf,pagesize=landscape(A4),rightMargin=12*mm,leftMargin=12*mm,topMargin=12*mm,bottomMargin=12*mm)
-    styles=getSampleStyleSheet()
-    title=ParagraphStyle("title",parent=styles["Title"],fontName="Helvetica-Bold",fontSize=24,textColor=colors.HexColor(BRAND_GREEN),alignment=TA_CENTER,spaceAfter=8)
-    h=ParagraphStyle("h",parent=styles["Heading2"],fontName="Helvetica-Bold",fontSize=14,textColor=colors.HexColor(BRAND_GREEN))
-    body=ParagraphStyle("body",parent=styles["BodyText"],fontSize=8.5)
-    story=[]
-    if COVER_IMG.exists():
-        story.append(RLImage(str(COVER_IMG),width=255*mm,height=120*mm))
-    logo_cells = []
-    for lp in [ALTA_LOGO, DDDC_LOGO, DAR_LOGO]:
-        if lp.exists():
-            logo_cells.append(RLImage(str(lp), width=32*mm, height=15*mm))
-        else:
-            logo_cells.append("")
-    if logo_cells:
-        lt = Table([logo_cells], colWidths=[65*mm,65*mm,65*mm])
-        lt.setStyle(TableStyle([("ALIGN",(0,0),(-1,-1),"CENTER"),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
-        story.append(Spacer(1,6)); story.append(lt)
-    story.append(Spacer(1,6))
-    story.append(Paragraph("JUMEIRAH RETAIL DEVELOPMENT",title))
-    story.append(Paragraph("Owner / Employer: ALTA &nbsp;&nbsp; | &nbsp;&nbsp; Contractor: DDDC &nbsp;&nbsp; | &nbsp;&nbsp; Consultant: DAR",body))
-    story.append(Paragraph(f"Data Date: {fmt_date(data_date)}",body))
-    story.append(PageBreak())
+def _curve_resample(curve, freq="MS"):
+    if curve is None or curve.empty:
+        return pd.DataFrame(columns=["date","planned","actual","cum_planned","cum_actual","cum_planned_pct","cum_actual_pct"])
+    d=curve.copy()
+    d["date"]=pd.to_datetime(d["date"],errors="coerce")
+    d=d.dropna(subset=["date"]).set_index("date")
+    for col in ["planned","actual"]:
+        if col not in d.columns: d[col]=0.0
+    out=d[["planned","actual"]].resample(freq).sum().reset_index()
+    out["cum_planned"]=out["planned"].cumsum(); out["cum_actual"]=out["actual"].cumsum()
+    pt=out["planned"].sum()
+    out["cum_planned_pct"]=np.where(pt!=0,out["cum_planned"]/pt*100,0.0)
+    out["cum_actual_pct"]=np.where(pt!=0,out["cum_actual"]/pt*100,0.0)
+    return out
 
-    story.append(Paragraph("Executive Summary",h))
-    data=[
-        ["Contract Commencement",fmt_date(bf["start"]),"Contract Completion",fmt_date(bf["finish"])],
+def _history_snapshot():
+    active=curr if curr is not None else base
+    return build_history_curves(
+        project_db_sheets, data_date,
+        current_mhr_actual=mhr_actual, current_cost_actual=cost_actual,
+        current_mhr_plan=mhr_plan, current_cost_plan=cost_plan
+    )
+
+def _current_week_summary(history):
+    if history is None or history.empty:
+        return {k:np.nan for k in ["mhr_wp","mhr_wa","mhr_cp","mhr_ca","mhr_var","cost_wp","cost_wa","cost_cp","cost_ca","cost_var"]}
+    r=history.sort_values("Data Date").iloc[-1]
+    return {
+        "mhr_wp":r.get("MHR Weekly Plan %",np.nan), "mhr_wa":r.get("MHR Weekly Actual %",np.nan),
+        "mhr_cp":r.get("MHR Cumulative Plan %",np.nan), "mhr_ca":r.get("MHR Cumulative Actual %",np.nan),
+        "mhr_var":r.get("MHR Cumulative Actual %",np.nan)-r.get("MHR Cumulative Plan %",np.nan),
+        "cost_wp":r.get("Cost Weekly Plan %",np.nan), "cost_wa":r.get("Cost Weekly Actual %",np.nan),
+        "cost_cp":r.get("Cost Cumulative Plan %",np.nan), "cost_ca":r.get("Cost Cumulative Actual %",np.nan),
+        "cost_var":r.get("Cost Cumulative Actual %",np.nan)-r.get("Cost Cumulative Plan %",np.nan),
+    }
+
+def _db_text(section, default="Data not provided"):
+    df=db_sheet(project_db_sheets,"Weekly Narrative")
+    if df.empty or "Section" not in df.columns:
+        return default
+    hit=df[df["Section"].astype(str).str.strip().str.lower()==section.strip().lower()]
+    if hit.empty: return default
+    col="Narrative / Details" if "Narrative / Details" in hit.columns else hit.columns[-1]
+    v=hit.iloc[0][col]
+    return default if pd.isna(v) or str(v).strip()=="" else str(v)
+
+
+def _mpl_bytes(fig):
+    out=BytesIO(); fig.savefig(out,format="png",dpi=170,bbox_inches="tight",facecolor="white"); plt.close(fig); out.seek(0); return out.getvalue()
+
+def _curve_png(curve,title):
+    if curve is None or curve.empty:return None
+    fig,ax=plt.subplots(figsize=(12.5,5.5))
+    ax.plot(curve["date"],curve["cum_planned_pct"],marker="o",linewidth=2.4,label="Planned",color=BRAND_GREEN)
+    ax.plot(curve["date"],curve["cum_actual_pct"],marker="o",linewidth=2.4,label="Actual",color=BRAND_YELLOW)
+    ax.set_title(title,fontsize=14,fontweight="bold");ax.set_ylabel("Cumulative Progress %");ax.grid(True,alpha=.22);ax.legend(loc="upper left",ncol=2)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%y"));fig.autofmt_xdate(rotation=35)
+    fig.tight_layout();return _mpl_bytes(fig)
+
+def _cashflow_png(curve,title):
+    if curve is None or curve.empty:return None
+    fig,ax=plt.subplots(figsize=(12.5,5.5));x=pd.to_datetime(curve["date"])
+    width=12 if len(curve)<24 else 3
+    ax.bar(x-pd.to_timedelta(width/2,unit="D"),curve["planned"],width=width,label="Planned Period",color=BRAND_GREEN)
+    ax.bar(x+pd.to_timedelta(width/2,unit="D"),curve["actual"],width=width,label="Actual Period",color=BRAND_YELLOW)
+    ax2=ax.twinx();ax2.plot(x,curve["cum_planned"],linewidth=2.2,label="Cum Planned",color="#246B8E");ax2.plot(x,curve["cum_actual"],linewidth=2.2,label="Cum Actual",color=BRAND_RED)
+    ax.set_title(title,fontsize=14,fontweight="bold");ax.set_ylabel("Period Value");ax2.set_ylabel("Cumulative Value");ax.grid(True,axis="y",alpha=.2)
+    lines,labels=ax.get_legend_handles_labels(); lines2,labels2=ax2.get_legend_handles_labels(); ax.legend(lines+lines2,labels+labels2,loc="upper left",ncol=4,fontsize=8)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b-%y"));fig.autofmt_xdate(rotation=35);fig.tight_layout();return _mpl_bytes(fig)
+
+def _manpower_png(mp,title):
+    if mp is None or mp.empty:return None
+    fig,ax=plt.subplots(figsize=(12.5,5.5));x=pd.to_datetime(mp["date"]);idx=np.arange(len(x));w=.38
+    ax.bar(idx-w/2,pd.to_numeric(mp["planned"],errors="coerce").fillna(0),w,label="Planned",color=BRAND_GREEN)
+    ax.bar(idx+w/2,pd.to_numeric(mp["actual"],errors="coerce").fillna(0),w,label="Actual",color=BRAND_YELLOW)
+    step=max(1,len(idx)//14);ax.set_xticks(idx[::step]);ax.set_xticklabels([d.strftime("%d-%b-%y") for d in x.iloc[::step]],rotation=40,ha="right")
+    ax.set_title(title,fontsize=14,fontweight="bold");ax.set_ylabel("Headcount");ax.grid(True,axis="y",alpha=.2);ax.legend();fig.tight_layout();return _mpl_bytes(fig)
+
+def _compare_png(labels,planned,actual,title):
+    fig,ax=plt.subplots(figsize=(7.5,4.8));idx=np.arange(len(labels));w=.36
+    ax.bar(idx-w/2,planned,w,label="Planned",color=BRAND_GREEN);ax.bar(idx+w/2,actual,w,label="Actual",color=BRAND_YELLOW)
+    ax.set_xticks(idx);ax.set_xticklabels(labels);ax.set_title(title,fontweight="bold");ax.set_ylabel("%");ax.legend();ax.grid(True,axis="y",alpha=.2);fig.tight_layout();return _mpl_bytes(fig)
+
+def _fig_png(fig, width=1500, height=780):
+    if fig is None: return None
+    try:
+        fig.update_layout(template="plotly_white",font=dict(family="Arial",size=14),
+                          legend=dict(orientation="h",yanchor="bottom",y=1.02,xanchor="right",x=1),
+                          margin=dict(l=65,r=45,t=55,b=55))
+        return fig.to_image(format="png",width=width,height=height,scale=2)
+    except Exception:
+        return None
+
+def _curve_fig(curve, title, planned_label="Planned", actual_label="Actual", weekly=False):
+    if curve is None or curve.empty: return None
+    f=go.Figure()
+    f.add_trace(go.Scatter(x=curve["date"],y=curve["cum_planned_pct"],name=planned_label,mode="lines+markers",line=dict(width=3,color=BRAND_GREEN)))
+    f.add_trace(go.Scatter(x=curve["date"],y=curve["cum_actual_pct"],name=actual_label,mode="lines+markers",line=dict(width=3,color=BRAND_YELLOW)))
+    f.update_layout(title=title,yaxis_title="Cumulative Progress %",xaxis_title="",yaxis=dict(range=[0,max(100,float(curve[["cum_planned_pct","cum_actual_pct"]].max().max())*1.08)]))
+    return f
+
+def _cashflow_fig(curve, title):
+    if curve is None or curve.empty:return None
+    f=go.Figure()
+    f.add_bar(x=curve["date"],y=curve["planned"],name="Planned Period",marker_color=BRAND_GREEN)
+    f.add_bar(x=curve["date"],y=curve["actual"],name="Actual Period",marker_color=BRAND_YELLOW)
+    f.add_trace(go.Scatter(x=curve["date"],y=curve["cum_planned"],name="Cumulative Planned",mode="lines+markers",yaxis="y2",line=dict(color="#246B8E",width=3)))
+    f.add_trace(go.Scatter(x=curve["date"],y=curve["cum_actual"],name="Cumulative Actual",mode="lines+markers",yaxis="y2",line=dict(color=BRAND_RED,width=3)))
+    f.update_layout(title=title,barmode="group",yaxis_title="Period Value",yaxis2=dict(title="Cumulative",overlaying="y",side="right"),xaxis_title="")
+    return f
+
+def _manpower_fig(mp, title):
+    if mp is None or mp.empty:return None
+    f=go.Figure()
+    f.add_bar(x=mp["date"],y=mp["planned"],name="Planned",marker_color=BRAND_GREEN)
+    f.add_bar(x=mp["date"],y=mp["actual"],name="Actual",marker_color=BRAND_YELLOW)
+    f.update_layout(title=title,barmode="group",yaxis_title="Headcount",xaxis_title="")
+    return f
+
+
+def make_updated_project_database():
+    """Append/replace the current update snapshot while preserving the user's workbook formatting."""
+    try:
+        raw = project_db_file.getvalue() if project_db_file is not None else DB_TEMPLATE.read_bytes()
+        wb = load_workbook(BytesIO(raw))
+        if "Update History" not in wb.sheetnames:
+            ws = wb.create_sheet("Update History")
+            ws.append(["Data Date","Report No.","MHR Cumulative Plan %","MHR Cumulative Actual %","Cost Cumulative Plan %","Cost Cumulative Actual %","Forecast Completion","Negative Float Activities","Notes"])
+        ws=wb["Update History"]
+        target=None
+        for r in range(2,ws.max_row+1):
+            v=ws.cell(r,1).value
+            if v and pd.notna(pd.to_datetime(v,errors="coerce")) and pd.Timestamp(pd.to_datetime(v)).normalize()==pd.Timestamp(data_date).normalize():
+                target=r;break
+        if target is None: target=max(2,ws.max_row+1)
+        active=curr if curr is not None else base
+        values=[pd.Timestamp(data_date).to_pydatetime(),get_setup(project_setup,"Report Number",None),mhr_plan,mhr_actual,cost_plan,cost_actual,
+                pd.Timestamp(forecast_finish).to_pydatetime() if pd.notna(forecast_finish) else None,int((active.total_float_days<0).sum()),"Updated by Project Controls Hub"]
+        for col,val in enumerate(values,1): ws.cell(target,col).value=val
+        out=BytesIO();wb.save(out);out.seek(0);return out.getvalue()
+    except Exception:
+        return None
+
+def make_pdf():
+    """Client/consultant-grade A3 WPR following the reference report structure."""
+    buf=BytesIO(); c=canvas.Canvas(buf,pagesize=A3)
+    project=str(get_setup(project_setup,"Project Name","JUMEIRAH RETAIL DEVELOPMENT"))
+    owner=str(get_setup(project_setup,"Owner / Employer","ALTA")); consultant=str(get_setup(project_setup,"Consultant","DAR")); contractor=str(get_setup(project_setup,"Contractor","DDDC"))
+    report_no=get_setup(project_setup,"Report Number","")
+    period_from=pd.to_datetime(get_setup(project_setup,"Reporting Period From",pd.NaT),errors="coerce")
+    period_to=pd.to_datetime(get_setup(project_setup,"Reporting Period To",data_date),errors="coerce")
+    active=curr if curr is not None else base
+    neg_count=int((active.total_float_days<0).sum())
+    critical_count=int((active.total_float_days<=0).sum())
+    history=_history_snapshot(); wk=_current_week_summary(history)
+    page_no=0
+
+    def logos(canvas_obj, W, H, top=18*mm):
+        items=[(ALTA_LOGO,18*mm),(DDDC_LOGO,18*mm),(DAR_LOGO,12*mm)]
+        x=16*mm
+        for path,h in items:
+            if path.exists():
+                try:
+                    im=ImageReader(str(path)); iw,ih=im.getSize(); w=h*iw/ih
+                    canvas_obj.drawImage(im,x,H-top-h,width=w,height=h,mask='auto',preserveAspectRatio=True)
+                    x+=w+8*mm
+                except Exception: pass
+
+    def footer(canvas_obj,W,H):
+        nonlocal page_no
+        canvas_obj.setStrokeColor(colors.HexColor(BRAND_SILVER)); canvas_obj.line(15*mm,12*mm,W-15*mm,12*mm)
+        canvas_obj.setFont("Helvetica",7.5); canvas_obj.setFillColor(colors.HexColor("#5A5A5A"))
+        canvas_obj.drawString(15*mm,7*mm,f"{project} | Weekly Progress Report {report_no} | Data Date {fmt_date(data_date)}")
+        canvas_obj.drawRightString(W-15*mm,7*mm,f"Page {page_no}")
+
+    def page(title, landscape_mode=False, subtitle=None):
+        nonlocal page_no
+        if page_no>0: c.showPage()
+        size=landscape(A3) if landscape_mode else A3; c.setPageSize(size); W,H=size; page_no+=1
+        c.setFillColor(colors.white); c.rect(0,0,W,H,fill=1,stroke=0)
+        logos(c,W,H)
+        c.setFillColor(colors.HexColor(BRAND_GREEN)); c.rect(0,H-37*mm,W,7*mm,fill=1,stroke=0)
+        c.setFillColor(colors.HexColor(BRAND_BLACK)); c.setFont("Helvetica-Bold",18); c.drawString(16*mm,H-48*mm,title)
+        if subtitle:
+            c.setFont("Helvetica",8.5); c.setFillColor(colors.HexColor("#666666")); c.drawString(16*mm,H-55*mm,subtitle)
+        footer(c,W,H)
+        return W,H,H-64*mm
+
+    def draw_table(df,x,y,w,h=None,font=7.5,headers=True,negative_cols=None,max_rows=None,col_widths=None):
+        if df is None or df.empty:
+            c.setFillColor(colors.HexColor("#666666")); c.setFont("Helvetica-Oblique",10); c.drawString(x,y,"Data not provided")
+            return y-8*mm
+        d=df.copy()
+        if max_rows is not None: d=d.head(max_rows)
+        vals=[list(map(lambda z:"" if pd.isna(z) else str(z),d.columns))] if headers else []
+        for _,r in d.iterrows(): vals.append(["" if pd.isna(v) else str(v) for v in r.tolist()])
+        n=max(1,len(d.columns))
+        widths=col_widths if col_widths else [w/n]*n
+        t=Table(vals,colWidths=widths,repeatRows=1 if headers else 0)
+        style=[("BACKGROUND",(0,0),(-1,0),colors.HexColor(BRAND_GREEN)),("TEXTCOLOR",(0,0),(-1,0),colors.white),
+               ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),font),
+               ("GRID",(0,0),(-1,-1),0.3,colors.HexColor(BRAND_SILVER)),("VALIGN",(0,0),(-1,-1),"MIDDLE"),
+               ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white,colors.HexColor("#F7F7F5")])]
+        if negative_cols:
+            for idx in negative_cols:
+                for rr in range(1,len(vals)):
+                    try:
+                        txt=str(vals[rr][idx]).replace(' d','').replace('%','').replace(',','')
+                        if float(txt)<0: style.append(("TEXTCOLOR",(idx,rr),(idx,rr),colors.HexColor(BRAND_RED))); style.append(("FONTNAME",(idx,rr),(idx,rr),"Helvetica-Bold"))
+                    except Exception: pass
+        t.setStyle(TableStyle(style)); tw,th=t.wrap(w,h or 9999); t.drawOn(c,x,y-th); return y-th-5*mm
+
+    def draw_chart(fig,x,y,w,h):
+        png=fig if isinstance(fig,(bytes,bytearray)) else _fig_png(fig)
+        if png:
+            try: c.drawImage(ImageReader(BytesIO(png)),x,y-h,width=w,height=h,mask='auto',preserveAspectRatio=True); return
+            except Exception: pass
+        c.setStrokeColor(colors.HexColor(BRAND_SILVER)); c.rect(x,y-h,w,h,stroke=1,fill=0)
+        c.setFont("Helvetica-Oblique",9); c.setFillColor(colors.HexColor("#777777")); c.drawCentredString(x+w/2,y-h/2,"Chart unavailable / data not provided")
+
+    # 1 COVER
+    W,H=A3; c.setPageSize(A3); page_no=1
+    if COVER_IMG.exists():
+        try:c.drawImage(ImageReader(str(COVER_IMG)),0,0,width=W,height=H,mask='auto',preserveAspectRatio=True,anchor='c')
+        except Exception: pass
+    c.setFillColor(colors.Color(0,0,0,alpha=.55)); c.rect(0,0,W,H,fill=1,stroke=0)
+    logos(c,W,H,top=20*mm)
+    c.setFillColor(colors.white); c.setFont("Helvetica-Bold",30); c.drawString(22*mm,94*mm,project)
+    c.setFont("Helvetica",13); c.drawString(22*mm,82*mm,"WEEKLY PROGRESS REPORT")
+    c.setFont("Helvetica-Bold",11); c.drawString(22*mm,69*mm,f"Report No.: {report_no}")
+    c.setFont("Helvetica",10); c.drawString(22*mm,59*mm,f"Reporting Period: {fmt_date(period_from)} to {fmt_date(period_to)}")
+    c.drawString(22*mm,50*mm,f"Data Date: {fmt_date(data_date)}")
+    c.drawString(22*mm,36*mm,f"Owner / Employer: {owner}    |    Consultant: {consultant}    |    Contractor: {contractor}")
+
+    # 2 TOC
+    W,H,y=page("Table of Contents",False)
+    toc=[
+        ["01","Project Overview"],["02","Executive Dashboard"],["03","Progress Summary"],["04","Major Trades Tracker"],
+        ["05","Progress Analysis / Narrative"],["06","Labor Force"],["07","AoC & Risk"],["08","Updated S-Curves"],
+        ["09","Engineering Control"],["10","Procurement Control"],["11",f"{lookahead_weeks}-Week Lookahead"],
+        ["12","Structure & Finishes Trackers"],["13","QC Report"],["14","RFI"],["15","Commercial Status"],["16","Progress Photos"]]
+    draw_table(pd.DataFrame(toc,columns=["Section","Description"]),28*mm,y-8*mm,W-56*mm,font=10,col_widths=[25*mm,W-81*mm])
+
+    # 3 Project Overview
+    W,H,y=page("1.1 - Project Overview",False)
+    setup_rows=[]
+    preferred=["Project Name","Owner / Employer","Consultant","Contractor","Contract Commencement","Contract Completion","Contract Value (AED)","Project Manager","Construction Manager","Planning Engineer","Commercial / QS","HSE Manager","QA/QC Manager"]
+    for k in preferred:
+        v=get_setup(project_setup,k,"Data not provided")
+        if "Date" in k or "Commencement" in k or "Completion" in k: v=fmt_date(pd.to_datetime(v,errors="coerce")) if pd.notna(pd.to_datetime(v,errors="coerce")) else str(v)
+        setup_rows.append([k,v])
+    draw_table(pd.DataFrame(setup_rows,columns=["Description","Status"]),25*mm,y-5*mm,W-50*mm,font=9,col_widths=[78*mm,W-128*mm])
+
+    # 4 Dashboard landscape
+    W,H,y=page("Executive Dashboard",True,"Overall project performance, schedule, MHR and cost progress")
+    contract_start=pd.to_datetime(get_setup(project_setup,"Contract Commencement",bf["start"]),errors="coerce")
+    contract_finish=pd.to_datetime(get_setup(project_setup,"Contract Completion",bf["finish"]),errors="coerce")
+    dash=pd.DataFrame([
+        ["Contract Commencement",fmt_date(contract_start),"Contract Completion",fmt_date(contract_finish)],
         ["Forecast Completion",fmt_date(forecast_finish),"Forecast Movement",f"{forecast_move:+.0f} d" if pd.notna(forecast_move) else "—"],
         ["Time Elapsed",f"{elapsed_days:.0f} d","Remaining Time",f"{remaining_days:.0f} d"],
-        ["Critical Activities",str(bf["critical"]),"Negative Float",str(bf["negative"])],
+        ["Critical Activities",critical_count,"Negative Float",neg_count],
         ["MHR Planned",f"{mhr_plan:.2f}%" if pd.notna(mhr_plan) else "N/A","MHR Actual",f"{mhr_actual:.2f}%" if pd.notna(mhr_actual) else "N/A"],
         ["Cost Planned",f"{cost_plan:.2f}%" if pd.notna(cost_plan) else "N/A","Cost Actual",f"{cost_actual:.2f}%" if pd.notna(cost_actual) else "N/A"],
-    ]
-    t=Table(data,colWidths=[55*mm,35*mm,55*mm,35*mm])
-    t.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,-1),colors.HexColor("#F7F7F5")),
-        ("GRID",(0,0),(-1,-1),.35,colors.HexColor("#D1D3D4")),
-        ("FONTNAME",(0,0),(-1,-1),"Helvetica"),
-        ("FONTSIZE",(0,0),(-1,-1),8),
-        ("FONTNAME",(0,0),(0,-1),"Helvetica-Bold"),
-        ("FONTNAME",(2,0),(2,-1),"Helvetica-Bold"),
-    ]))
-    story.append(t); story.append(Spacer(1,8))
+    ],columns=["Description","Status","Description 2","Status 2"])
+    draw_table(dash,18*mm,y,W*0.45,font=8.5,col_widths=[50*mm,33*mm,50*mm,33*mm])
+    summary=pd.DataFrame([
+        ["MHR",wk["mhr_wp"],wk["mhr_wa"],wk["mhr_cp"],wk["mhr_ca"],wk["mhr_var"]],
+        ["Cost",wk["cost_wp"],wk["cost_wa"],wk["cost_cp"],wk["cost_ca"],wk["cost_var"]],
+    ],columns=["Basis","Weekly Plan %","Weekly Actual %","Cumulative Plan %","Cumulative Actual %","Variance %"])
+    for cc in summary.columns[1:]: summary[cc]=summary[cc].map(lambda v:"N/A" if pd.isna(v) else f"{v:.2f}%")
+    draw_table(summary,W*0.49,y,W*0.48,font=8.2,negative_cols=[5])
+    # duration + variance charts
+    dd=pd.DataFrame({"Metric":["Original Duration","At Completion Duration","Time Elapsed"],"Days":[duration_days,duration_days+(forecast_move if pd.notna(forecast_move) else 0),elapsed_days]})
+    f=px.bar(dd,x="Days",y="Metric",orientation="h",text="Days",title="Project Duration"); f.update_layout(showlegend=False)
+    draw_chart(_compare_png(dd["Metric"].tolist(),dd["Days"].tolist(),[0,0,0],"Project Duration"),18*mm,y-64*mm,W*0.45,72*mm)
+    var_df=pd.DataFrame({"Basis":["MHR","Cost"],"Plan":[mhr_plan,cost_plan],"Actual":[mhr_actual,cost_actual]})
+    vf=go.Figure();vf.add_bar(x=var_df.Basis,y=var_df.Plan,name="Planned",marker_color=BRAND_GREEN);vf.add_bar(x=var_df.Basis,y=var_df.Actual,name="Actual",marker_color=BRAND_YELLOW);vf.update_layout(title="Cumulative Progress")
+    draw_chart(_compare_png(var_df.Basis.tolist(),var_df.Plan.fillna(0).tolist(),var_df.Actual.fillna(0).tolist(),"Cumulative Progress"),W*0.49,y-64*mm,W*0.48,72*mm)
 
-    # Management charts from dashboard
-    chart_items = []
-    if not unit_curve.empty:
-        f = go.Figure()
-        f.add_trace(go.Scatter(x=unit_curve["date"], y=unit_curve["cum_planned_pct"], name="MHR Planned", mode="lines"))
-        f.add_trace(go.Scatter(x=unit_curve["date"], y=unit_curve["cum_actual_pct"], name="MHR Actual", mode="lines"))
-        f.update_layout(title="MHR / Unit S-Curve", height=420, yaxis_title="Cumulative %", xaxis_title="")
-        chart_items.append(f)
-    if not cost_curve.empty:
-        f = go.Figure()
-        f.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_planned_pct"], name="Cost Planned", mode="lines"))
-        f.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_actual_pct"], name="Cost Actual", mode="lines"))
-        f.update_layout(title="Cost S-Curve", height=420, yaxis_title="Cumulative %", xaxis_title="")
-        chart_items.append(f)
-        cf = go.Figure()
-        cf.add_bar(x=cost_curve["date"], y=cost_curve["planned"], name="Monthly Planned")
-        cf.add_bar(x=cost_curve["date"], y=cost_curve["actual"], name="Monthly Actual")
-        cf.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_planned"], name="Cumulative Planned", mode="lines+markers", yaxis="y2"))
-        cf.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_actual"], name="Cumulative Actual", mode="lines+markers", yaxis="y2"))
-        cf.update_layout(title="Cash Flow - Planned vs Actual", barmode="group", height=420, yaxis_title="Monthly", yaxis2=dict(title="Cumulative", overlaying="y", side="right"))
-        chart_items.append(cf)
-    if 'mp_chart' in globals() and isinstance(mp_chart, pd.DataFrame) and not mp_chart.empty:
-        mf = px.bar(mp_chart, x="date", y=["planned","actual"], barmode="group", title="Manpower - Planned vs Actual")
-        mf.update_layout(height=420, yaxis_title="Headcount")
-        chart_items.append(mf)
+    # 5 Progress Summary portrait
+    W,H,y=page("2.1 - Progress Summary",False,"Weightage bases are reported separately: Manhours / Units and Cost")
+    hist=history.sort_values("Data Date")
+    prev=hist.iloc[-2] if len(hist)>1 else None
+    cur=hist.iloc[-1] if len(hist)>0 else None
+    rows=[]
+    for basis in ["MHR","Cost"]:
+        if cur is None: rows.append([basis,"N/A"]*1); continue
+        last_wp=prev.get(f"{basis} Weekly Plan %",np.nan) if prev is not None else np.nan
+        last_wa=prev.get(f"{basis} Weekly Actual %",np.nan) if prev is not None else np.nan
+        last_cp=prev.get(f"{basis} Cumulative Plan %",np.nan) if prev is not None else np.nan
+        last_ca=prev.get(f"{basis} Cumulative Actual %",np.nan) if prev is not None else np.nan
+        rows.append([basis,last_wp,cur.get(f"{basis} Weekly Plan %",np.nan),last_wa,cur.get(f"{basis} Weekly Actual %",np.nan),last_cp,cur.get(f"{basis} Cumulative Plan %",np.nan),last_ca,cur.get(f"{basis} Cumulative Actual %",np.nan),cur.get(f"{basis} Cumulative Actual %",np.nan)-cur.get(f"{basis} Cumulative Plan %",np.nan)])
+    ps=pd.DataFrame(rows,columns=["Basis","Weekly Plan Last","Weekly Plan Current","Weekly Actual Last","Weekly Actual Current","Cum Plan Last","Cum Plan Current","Cum Actual Last","Cum Actual Current","Variance"])
+    for cc in ps.columns[1:]: ps[cc]=ps[cc].map(lambda v:"N/A" if pd.isna(v) else f"{v:.2f}%")
+    draw_table(ps,12*mm,y,W-24*mm,font=6.7,negative_cols=[9])
+    # two compact bar charts
+    mdf=pd.DataFrame({"Period":["Weekly","Cumulative"],"Planned":[wk["mhr_wp"],wk["mhr_cp"]],"Actual":[wk["mhr_wa"],wk["mhr_ca"]]})
+    mf=go.Figure();mf.add_bar(x=mdf.Period,y=mdf.Planned,name="Planned",marker_color=BRAND_GREEN);mf.add_bar(x=mdf.Period,y=mdf.Actual,name="Actual",marker_color=BRAND_YELLOW);mf.update_layout(title="MHR Progress",barmode="group",yaxis_title="%")
+    cdf=pd.DataFrame({"Period":["Weekly","Cumulative"],"Planned":[wk["cost_wp"],wk["cost_cp"]],"Actual":[wk["cost_wa"],wk["cost_ca"]]})
+    cf=go.Figure();cf.add_bar(x=cdf.Period,y=cdf.Planned,name="Planned",marker_color=BRAND_GREEN);cf.add_bar(x=cdf.Period,y=cdf.Actual,name="Actual",marker_color=BRAND_YELLOW);cf.update_layout(title="Cost Progress",barmode="group",yaxis_title="%")
+    draw_chart(_compare_png(mdf.Period.tolist(),mdf.Planned.fillna(0).tolist(),mdf.Actual.fillna(0).tolist(),"MHR Progress"),15*mm,y-65*mm,(W-40*mm)/2,73*mm); draw_chart(_compare_png(cdf.Period.tolist(),cdf.Planned.fillna(0).tolist(),cdf.Actual.fillna(0).tolist(),"Cost Progress"),W/2+5*mm,y-65*mm,(W-40*mm)/2,73*mm)
 
-    if chart_items:
-        story.append(PageBreak())
-        story.append(Paragraph("Progress Charts", h))
-        for ch in chart_items:
-            png = make_download_chart(ch, width=1200, height=620)
-            if png:
-                story.append(RLImage(BytesIO(png), width=210*mm, height=108*mm))
-                story.append(Spacer(1,6))
+    # 6 Major trades
+    W,H,y=page("2.4 - Major Trades Tracker",True)
+    mt=db_sheet(project_db_sheets,"Major Trades")
+    if not mt.empty and "Variance %" in mt.columns:
+        mt["Variance %"]=pd.to_numeric(mt["Variance %"],errors="coerce").map(lambda v:"" if pd.isna(v) else f"{v*100:.2f}%" if abs(v)<=1 else f"{v:.2f}%")
+    draw_table(mt,18*mm,y,W-36*mm,font=8,negative_cols=[4] if not mt.empty and len(mt.columns)>4 else None,max_rows=25)
 
-    # Negative float table
-    story.append(Paragraph("Schedule Risk / Negative Float",h))
-    active=curr if curr is not None else base
-    neg=active[active.total_float_days<0].sort_values("total_float_days").head(30)
-    rows=[["Activity ID","Activity Name","Finish","Total Float"]]
-    for _,r in neg.iterrows():
-        rows.append([r.task_code, str(r.task_name)[:70], fmt_date(r.finish), f"{r.total_float_days:.0f} d"])
-    tt=Table(rows,colWidths=[32*mm,125*mm,30*mm,25*mm])
-    tt.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),colors.HexColor(BRAND_GREEN)),
-        ("TEXTCOLOR",(0,0),(-1,0),colors.white),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),
-        ("FONTSIZE",(0,0),(-1,-1),7.5),
-        ("GRID",(0,0),(-1,-1),.3,colors.HexColor("#D1D3D4")),
-        ("TEXTCOLOR",(-1,1),(-1,-1),colors.HexColor(BRAND_RED)),
-    ]))
-    story.append(tt); story.append(PageBreak())
+    # 7 Progress analysis
+    W,H,y=page("3 - Progress Analysis",False)
+    narrative_sections=["Executive Summary","Key Achievements This Week","Planned Activities Next Week","Key Delays / Constraints","Recovery / Mitigation Measures","Client / Consultant Decisions Required"]
+    yy=y
+    for sec in narrative_sections:
+        c.setFillColor(colors.HexColor(BRAND_GREEN));c.setFont("Helvetica-Bold",11);c.drawString(18*mm,yy,sec)
+        yy-=6*mm;c.setFillColor(colors.HexColor("#333333"));c.setFont("Helvetica",8.5)
+        text=_db_text(sec); tx=c.beginText(18*mm,yy); tx.setLeading(11)
+        for line in str(text).splitlines() or [str(text)]:
+            # simple word wrap
+            words=line.split(); curline=""
+            for word in words:
+                if c.stringWidth(curline+" "+word,"Helvetica",8.5) > W-36*mm:
+                    tx.textLine(curline);curline=word
+                else: curline=(curline+" "+word).strip()
+            if curline: tx.textLine(curline)
+        c.drawText(tx); yy=tx.getY()-8*mm
+        if yy<35*mm: break
 
-    # Engineering
-    story.append(Paragraph("Engineering Control",h))
-    eng=(curr if curr is not None else base)
-    eng=eng[eng.category.isin(["Prequalification","Shop Drawings","Material Submittals"])].sort_values(["total_float_days","finish"]).head(35)
-    rows=[["Package","Stage","Finish","TF","Status"]]
-    for _,r in eng.iterrows():
-        rows.append([str(r.package)[:55],r.category,fmt_date(r.finish),f"{r.total_float_days:.0f} d" if pd.notna(r.total_float_days) else "—",status_from_float(r.total_float_days)])
-    tt=Table(rows,colWidths=[100*mm,40*mm,28*mm,20*mm,35*mm])
-    tt.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),colors.HexColor(BRAND_GREEN)),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),
-        ("GRID",(0,0),(-1,-1),.3,colors.HexColor("#D1D3D4")),
-    ]))
-    story.append(tt); story.append(PageBreak())
+    # 8 Labor Force
+    W,H,y=page("4 - Labor Force",False)
+    actual_mp=db_sheet(project_db_sheets,"Actual Manpower")
+    if not actual_mp.empty and "Date" in actual_mp.columns:
+        actual_mp["Date"]=pd.to_datetime(actual_mp["Date"],errors="coerce"); actual_mp=actual_mp.dropna(subset=["Date"])
+    mpw=manpower_plan_weekly.copy() if manpower_plan_weekly is not None else pd.DataFrame()
+    if not mpw.empty:
+        mpw["date"]=pd.to_datetime(mpw["date"],errors="coerce")
+        if not actual_mp.empty:
+            amp=actual_mp.copy(); amp["Total"]=pd.to_numeric(amp.get("Total"),errors="coerce")
+            amp=amp.set_index("Date")["Total"].resample("W").mean().reset_index().rename(columns={"Date":"date","Total":"actual"})
+            mpw=pd.merge(mpw,amp,on="date",how="left");mpw["actual"]=mpw["actual"].fillna(0)
+        else: mpw["actual"]=0
+    else:
+        mpw=pd.DataFrame(columns=["date","planned","actual"])
+    draw_chart(_manpower_png(mpw,"Weekly Planned vs Actual Manpower"),15*mm,y,(W-30*mm),95*mm)
+    if not actual_mp.empty:
+        show=actual_mp.tail(20).copy(); show["Date"]=show["Date"].dt.strftime("%d-%b-%Y")
+        draw_table(show,15*mm,y-105*mm,W-30*mm,font=6.5,max_rows=20)
 
-    # Procurement
-    story.append(Paragraph("Procurement Action Register",h))
-    proc=(curr if curr is not None else base)
-    proc=proc[proc.category=="Procurement"].copy()
-    proc["Action"]=proc.apply(procurement_action,axis=1,dd=data_date)
-    proc=proc.sort_values(["total_float_days","finish"]).head(35)
-    rows=[["Activity ID","Procurement Item","Finish","TF","Action"]]
-    for _,r in proc.iterrows():
-        rows.append([r.task_code,str(r.task_name)[:70],fmt_date(r.finish),f"{r.total_float_days:.0f} d" if pd.notna(r.total_float_days) else "—",r.Action])
-    tt=Table(rows,colWidths=[28*mm,120*mm,28*mm,18*mm,45*mm])
-    tt.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),colors.HexColor(BRAND_GREEN)),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),
-        ("GRID",(0,0),(-1,-1),.3,colors.HexColor("#D1D3D4")),
-    ]))
-    story.append(tt); story.append(PageBreak())
+    # 9 risks
+    W,H,y=page("5.1 - AoC & Risk",True)
+    risks=db_sheet(project_db_sheets,"Risks & Actions")
+    draw_table(risks,15*mm,y,W-30*mm,font=7,max_rows=28)
 
-    # Lookahead
-    story.append(Paragraph(f"{lookahead_weeks}-Week Lookahead",h))
-    la=date_window(curr if curr is not None else base,data_date,lookahead_weeks).head(45)
-    rows=[["Activity ID","Activity Name","Start","Finish","TF"]]
-    for _,r in la.iterrows():
-        rows.append([r.task_code,str(r.task_name)[:78],fmt_date(r.start),fmt_date(r.finish),f"{r.total_float_days:.0f} d" if pd.notna(r.total_float_days) else "—"])
-    tt=Table(rows,colWidths=[30*mm,125*mm,28*mm,28*mm,18*mm])
-    tt.setStyle(TableStyle([
-        ("BACKGROUND",(0,0),(-1,0),colors.HexColor(BRAND_GREEN)),("TEXTCOLOR",(0,0),(-1,0),colors.white),
-        ("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("FONTSIZE",(0,0),(-1,-1),7),
-        ("GRID",(0,0),(-1,-1),.3,colors.HexColor("#D1D3D4")),
-    ]))
-    story.append(tt)
+    # 10 s-curves section cover
+    W,H,y=page("6 - Updated S-Curves",True,"Approved planned curves versus actual progress at current data date")
+    c.setFillColor(colors.HexColor(BRAND_GREEN));c.setFont("Helvetica-Bold",28);c.drawCentredString(W/2,H/2+15*mm,"S-CURVES / CASH FLOW / MANPOWER")
+    c.setFillColor(colors.HexColor("#555555"));c.setFont("Helvetica",13);c.drawCentredString(W/2,H/2,"Monthly and Weekly - Planned vs Actual")
 
-    if progress_photos:
-        story.append(PageBreak()); story.append(Paragraph("Progress Photos",h))
-        for p in progress_photos[:6]:
-            pdata=BytesIO(p.getvalue())
+    # 11-16 charts
+    cost_m=_curve_resample(cost_curve,"MS"); cost_w=_curve_resample(cost_curve,"W")
+    unit_m=_curve_resample(unit_curve,"MS"); unit_w=_curve_resample(unit_curve,"W")
+    for title,fig in [
+        ("6.1 - Cost S-Curve Monthly",_curve_png(cost_m,"Cost Progress - Monthly")),
+        ("6.2 - Cost S-Curve Weekly",_curve_png(cost_w,"Cost Progress - Weekly")),
+        ("6.3 - Unit / MHR S-Curve Monthly",_curve_png(unit_m,"MHR / Unit Progress - Monthly")),
+        ("6.4 - Unit / MHR S-Curve Weekly",_curve_png(unit_w,"MHR / Unit Progress - Weekly")),
+        ("6.1A - Cash Flow Monthly",_cashflow_png(cost_m,"Cash Flow - Monthly Planned vs Actual")),
+        ("6.2A - Cash Flow Weekly",_cashflow_png(cost_w,"Cash Flow - Weekly Planned vs Actual")),
+    ]:
+        W,H,y=page(title,True); draw_chart(fig,18*mm,y,W-36*mm,150*mm)
+
+    # manpower monthly/weekly
+    mpm=manpower_plan_monthly.copy() if manpower_plan_monthly is not None else pd.DataFrame()
+    mpw2=mpw.copy()
+    if not mpm.empty:
+        mpm["date"]=pd.to_datetime(mpm["date"],errors="coerce"); mpm["actual"]=0.0
+        if not actual_mp.empty:
+            ma=actual_mp.set_index("Date")["Total"].resample("MS").mean().reset_index().rename(columns={"Date":"date","Total":"actual"})
+            mpm=pd.merge(mpm[["date","planned"]],ma,on="date",how="left");mpm["actual"]=mpm["actual"].fillna(0)
+    for title,mpdata in [("6.5 - Manpower Histogram Monthly",mpm),("6.6 - Manpower Histogram Weekly",mpw2)]:
+        W,H,y=page(title,True);draw_chart(_manpower_png(mpdata,title),18*mm,y,W-36*mm,150*mm)
+
+    # engineering
+    W,H,y=page("Engineering Control - Major Package Wise",True)
+    eng=active[active.category.isin(["Prequalification","Shop Drawings","Material Submittals"])].copy()
+    eng["Status"]=eng.total_float_days.apply(status_from_float);eng["TF"]=eng.total_float_days.map(lambda v:"—" if pd.isna(v) else f"{v:.0f} d")
+    eng["Finish Date"]=eng.finish.map(fmt_date)
+    engout=eng[["package","category","Finish Date","TF","Status"]].rename(columns={"package":"Package","category":"Stage"}).sort_values(["Status","Finish Date"])
+    draw_table(engout,12*mm,y,W-24*mm,font=6.6,negative_cols=[3],max_rows=44,col_widths=[110*mm,42*mm,30*mm,22*mm,45*mm])
+
+    # procurement
+    W,H,y=page("Procurement Action Register",True)
+    proc=active[active.category=="Procurement"].copy();proc["Action"]=proc.apply(procurement_action,axis=1,dd=data_date);proc["Finish Date"]=proc.finish.map(fmt_date);proc["TF"]=proc.total_float_days.map(lambda v:"—" if pd.isna(v) else f"{v:.0f} d")
+    pout=proc[["task_code","task_name","Finish Date","TF","Action"]].rename(columns={"task_code":"Activity ID","task_name":"Procurement Item"}).sort_values("Action")
+    draw_table(pout,12*mm,y,W-24*mm,font=6.5,negative_cols=[3],max_rows=44,col_widths=[32*mm,120*mm,30*mm,22*mm,50*mm])
+
+    # lookahead
+    W,H,y=page(f"{lookahead_weeks}-Week Lookahead",True,f"Window: {fmt_date(data_date)} to {fmt_date(data_date+pd.Timedelta(weeks=lookahead_weeks))}")
+    la=date_window(active,data_date,lookahead_weeks).copy();la["Start Date"]=la.start.map(fmt_date);la["Finish Date"]=la.finish.map(fmt_date);la["TF"]=la.total_float_days.map(lambda v:"—" if pd.isna(v) else f"{v:.0f} d")
+    laout=la[["task_code","task_name","category","Start Date","Finish Date","TF"]].rename(columns={"task_code":"Activity ID","task_name":"Activity Name","category":"Category"})
+    draw_table(laout,10*mm,y,W-20*mm,font=6.1,negative_cols=[5],max_rows=48,col_widths=[30*mm,125*mm,35*mm,28*mm,28*mm,18*mm])
+
+    # trackers
+    for sheet_name,title in [("Structure Tracker","7.1 - Structure Tracker"),("Finishes Tracker","7.2 - Finishes Tracker")]:
+        W,H,y=page(title,True); df=db_sheet(project_db_sheets,sheet_name); draw_table(df,12*mm,y,W-24*mm,font=6.8,max_rows=35)
+
+    # QC
+    W,H,y=page("8 - QC Report",False); draw_table(db_sheet(project_db_sheets,"QC"),18*mm,y,W-36*mm,font=8,max_rows=35)
+    # RFI
+    W,H,y=page("9 - RFI",False); draw_table(db_sheet(project_db_sheets,"RFI"),12*mm,y,W-24*mm,font=6.8,max_rows=38)
+    # Commercial
+    W,H,y=page("10 - Commercial Status",True); draw_table(db_sheet(project_db_sheets,"Commercial"),18*mm,y,W-36*mm,font=8,max_rows=30)
+
+    # Photos, 4 per portrait page
+    photos=progress_photos or []
+    if not photos:
+        W,H,y=page("11 - Progress Photos",False);c.setFont("Helvetica-Oblique",12);c.setFillColor(colors.HexColor("#666666"));c.drawCentredString(W/2,H/2,"Progress photos not provided")
+    else:
+        for start in range(0,len(photos),4):
+            W,H,y=page("11 - Progress Photos",False,f"Photos {start+1} to {min(start+4,len(photos))}")
+            slots=[(18*mm,H-78*mm),(W/2+4*mm,H-78*mm),(18*mm,H/2-12*mm),(W/2+4*mm,H/2-12*mm)]
+            pw=W/2-26*mm; ph=118*mm
+            for pfile,(x,ytop) in zip(photos[start:start+4],slots):
+                try:
+                    img=ImageReader(BytesIO(pfile.getvalue())); iw,ih=img.getSize(); ratio=min(pw/iw,ph/ih); ww,hh=iw*ratio,ih*ratio
+                    c.drawImage(img,x+(pw-ww)/2,ytop-ph+(ph-hh)/2,width=ww,height=hh,mask='auto')
+                    c.setFont("Helvetica",7.5);c.setFillColor(colors.HexColor("#555555"));c.drawString(x,ytop-ph-5*mm,pfile.name[:65])
+                except Exception: pass
+
+    c.save();buf.seek(0);return buf.getvalue()
+
+def _ppt_add_logos(slide, prs):
+    x=Inches(.35)
+    for path,h in [(ALTA_LOGO,.34),(DDDC_LOGO,.34),(DAR_LOGO,.28)]:
+        if path.exists():
             try:
-                story.append(RLImage(pdata,width=110*mm,height=70*mm))
-                story.append(Spacer(1,4))
-            except: pass
+                pic=slide.shapes.add_picture(str(path),x,Inches(.18),height=Inches(h));x+=pic.width+Inches(.18)
+            except Exception: pass
 
-    doc.build(story)
-    buf.seek(0)
-    return buf.getvalue()
+def _ppt_title(slide,title,subtitle=None):
+    _ppt_add_logos(slide,None)
+    bar=slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,0,Inches(.72),Inches(13.333),Inches(.10));bar.fill.solid();bar.fill.fore_color.rgb=RGBColor(7,121,92);bar.line.fill.background()
+    tb=slide.shapes.add_textbox(Inches(.45),Inches(.93),Inches(12.2),Inches(.55));p=tb.text_frame.paragraphs[0];p.text=title;p.font.size=Pt(23);p.font.bold=True;p.font.color.rgb=RGBColor(18,18,18)
+    if subtitle:
+        sb=slide.shapes.add_textbox(Inches(.47),Inches(1.45),Inches(12),Inches(.32));q=sb.text_frame.paragraphs[0];q.text=subtitle;q.font.size=Pt(9);q.font.color.rgb=RGBColor(95,95,95)
 
-def add_title(slide, text):
-    box=slide.shapes.add_textbox(Inches(.5),Inches(.25),Inches(12.3),Inches(.5))
-    p=box.text_frame.paragraphs[0]; p.text=text; p.font.size=Pt(24); p.font.bold=True; p.font.color.rgb=RGBColor(7,121,92)
+def _ppt_table(slide,df,x,y,w,h,max_rows=12,font=10):
+    if df is None or df.empty:
+        tb=slide.shapes.add_textbox(Inches(x),Inches(y),Inches(w),Inches(.5));p=tb.text_frame.paragraphs[0];p.text="Data not provided";p.font.size=Pt(12);p.font.italic=True;return
+    d=df.head(max_rows).copy(); rows=len(d)+1; cols=len(d.columns)
+    table=slide.shapes.add_table(rows,cols,Inches(x),Inches(y),Inches(w),Inches(h)).table
+    widths=[w/cols]*cols
+    for j,col in enumerate(d.columns):
+        table.columns[j].width=Inches(widths[j]);cell=table.cell(0,j);cell.text=str(col);cell.fill.solid();cell.fill.fore_color.rgb=RGBColor(7,121,92)
+        for p in cell.text_frame.paragraphs:p.font.size=Pt(font);p.font.bold=True;p.font.color.rgb=RGBColor(255,255,255)
+    for i,(_,r) in enumerate(d.iterrows(),start=1):
+        for j,v in enumerate(r.tolist()):
+            cell=table.cell(i,j);cell.text="" if pd.isna(v) else str(v);cell.fill.solid();cell.fill.fore_color.rgb=RGBColor(247,247,245) if i%2==0 else RGBColor(255,255,255)
+            for p in cell.text_frame.paragraphs:
+                p.font.size=Pt(font-1);p.font.color.rgb=RGBColor(214,40,40) if isinstance(v,(int,float,np.integer,np.floating)) and v<0 else RGBColor(18,18,18)
 
 def make_pptx():
-    prs=Presentation()
-    prs.slide_width=Inches(13.333); prs.slide_height=Inches(7.5)
+    """Executive management deck: visual, decision-oriented, all key programme charts."""
+    prs=Presentation();prs.slide_width=Inches(13.333);prs.slide_height=Inches(7.5)
+    project=str(get_setup(project_setup,"Project Name","JUMEIRAH RETAIL DEVELOPMENT"));report_no=get_setup(project_setup,"Report Number","")
+    active=curr if curr is not None else base;neg_count=int((active.total_float_days<0).sum());critical_count=int((active.total_float_days<=0).sum())
+    history=_history_snapshot();wk=_current_week_summary(history)
 
     # cover
-    slide=prs.slides.add_slide(prs.slide_layouts[6])
-    if COVER_IMG.exists():
-        slide.shapes.add_picture(str(COVER_IMG),0,0,width=prs.slide_width,height=prs.slide_height)
-    overlay=slide.shapes.add_shape(MSO_SHAPE.RECTANGLE,0,0,Inches(6.3),prs.slide_height)
-    overlay.fill.solid(); overlay.fill.fore_color.rgb=RGBColor(18,18,18); overlay.fill.transparency=18; overlay.line.fill.background()
-    tb=slide.shapes.add_textbox(Inches(.6),Inches(4.6),Inches(5.4),Inches(1.4))
-    tf=tb.text_frame; p=tf.paragraphs[0]; p.text="JUMEIRAH RETAIL\nDEVELOPMENT"; p.font.size=Pt(30); p.font.bold=True; p.font.color.rgb=RGBColor(247,247,245)
-    p2=tf.add_paragraph(); p2.text=f"Data Date: {fmt_date(data_date)}"; p2.font.size=Pt(14); p2.font.color.rgb=RGBColor(209,211,212)
-    # Logos on cover
-    logo_x = 0.7
-    for lp in [ALTA_LOGO, DDDC_LOGO, DAR_LOGO]:
-        if lp.exists():
-            slide.shapes.add_picture(str(lp), Inches(logo_x), Inches(0.35), width=Inches(1.35), height=Inches(0.55))
-            logo_x += 1.55
+    s=prs.slides.add_slide(prs.slide_layouts[6])
+    if COVER_IMG.exists():s.shapes.add_picture(str(COVER_IMG),0,0,width=prs.slide_width,height=prs.slide_height)
+    ov=s.shapes.add_shape(MSO_SHAPE.RECTANGLE,0,0,Inches(6.4),prs.slide_height);ov.fill.solid();ov.fill.fore_color.rgb=RGBColor(18,18,18);ov.fill.transparency=18;ov.line.fill.background()
+    _ppt_add_logos(s,prs)
+    tb=s.shapes.add_textbox(Inches(.65),Inches(4.45),Inches(5.5),Inches(1.35));tf=tb.text_frame;p=tf.paragraphs[0];p.text=project;p.font.size=Pt(30);p.font.bold=True;p.font.color.rgb=RGBColor(255,255,255)
+    p2=tf.add_paragraph();p2.text=f"WEEKLY PROGRESS REPORT {report_no} | DATA DATE {fmt_date(data_date)}";p2.font.size=Pt(12);p2.font.color.rgb=RGBColor(209,211,212)
 
-    # executive
-    slide=prs.slides.add_slide(prs.slide_layouts[6]); add_title(slide,"Executive Project Summary")
-    metrics=[
-        ("Forecast Completion",fmt_date(forecast_finish)),
-        ("Forecast Movement",f"{forecast_move:+.0f} d" if pd.notna(forecast_move) else "—"),
-        ("Negative Float",str(bf["negative"])),
-        ("MHR Actual",f"{mhr_actual:.2f}%" if pd.notna(mhr_actual) else "N/A"),
-        ("Cost Actual",f"{cost_actual:.2f}%" if pd.notna(cost_actual) else "N/A"),
-    ]
-    x=.6
-    for title,val in metrics:
-        sh=slide.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,Inches(x),Inches(1.2),Inches(2.25),Inches(1.25))
-        sh.fill.solid(); sh.fill.fore_color.rgb=RGBColor(247,247,245); sh.line.color.rgb=RGBColor(209,211,212)
-        tf=sh.text_frame; tf.clear()
-        p=tf.paragraphs[0]; p.text=title; p.font.size=Pt(11); p.font.color.rgb=RGBColor(18,18,18)
-        q=tf.add_paragraph(); q.text=val; q.font.size=Pt(24); q.font.bold=True; q.font.color.rgb=RGBColor(214,40,40) if ("Movement" in title and pd.notna(forecast_move) and forecast_move>0) or title=="Negative Float" else RGBColor(7,121,92)
-        x+=2.45
+    # executive dashboard
+    s=prs.slides.add_slide(prs.slide_layouts[6]);_ppt_title(s,"Executive Project Dashboard",f"Data Date {fmt_date(data_date)}")
+    metrics=[("Forecast Finish",fmt_date(forecast_finish)),("Movement",f"{forecast_move:+.0f} d" if pd.notna(forecast_move) else "—"),("Critical",str(critical_count)),("Negative Float",str(neg_count)),("MHR Actual",f"{mhr_actual:.2f}%" if pd.notna(mhr_actual) else "N/A"),("Cost Actual",f"{cost_actual:.2f}%" if pd.notna(cost_actual) else "N/A")]
+    for i,(k,v) in enumerate(metrics):
+        row=i//3;col=i%3;x=.55+col*4.18;y=1.9+row*1.55
+        sh=s.shapes.add_shape(MSO_SHAPE.ROUNDED_RECTANGLE,Inches(x),Inches(y),Inches(3.75),Inches(1.15));sh.fill.solid();sh.fill.fore_color.rgb=RGBColor(247,247,245);sh.line.color.rgb=RGBColor(209,211,212)
+        tf=sh.text_frame;tf.clear();p=tf.paragraphs[0];p.text=k;p.font.size=Pt(10);p.font.color.rgb=RGBColor(90,90,90);q=tf.add_paragraph();q.text=v;q.font.size=Pt(24);q.font.bold=True;q.font.color.rgb=RGBColor(214,40,40) if (k in ["Movement","Negative Float"] and (k!="Movement" or (pd.notna(forecast_move) and forecast_move>0))) else RGBColor(7,121,92)
+    summ=pd.DataFrame([["MHR",f"{wk['mhr_wp']:.2f}%" if pd.notna(wk['mhr_wp']) else "N/A",f"{wk['mhr_wa']:.2f}%" if pd.notna(wk['mhr_wa']) else "N/A",f"{wk['mhr_cp']:.2f}%" if pd.notna(wk['mhr_cp']) else "N/A",f"{wk['mhr_ca']:.2f}%" if pd.notna(wk['mhr_ca']) else "N/A",f"{wk['mhr_var']:.2f}%" if pd.notna(wk['mhr_var']) else "N/A"],["Cost",f"{wk['cost_wp']:.2f}%" if pd.notna(wk['cost_wp']) else "N/A",f"{wk['cost_wa']:.2f}%" if pd.notna(wk['cost_wa']) else "N/A",f"{wk['cost_cp']:.2f}%" if pd.notna(wk['cost_cp']) else "N/A",f"{wk['cost_ca']:.2f}%" if pd.notna(wk['cost_ca']) else "N/A",f"{wk['cost_var']:.2f}%" if pd.notna(wk['cost_var']) else "N/A"]],columns=["Basis","Wk Plan","Wk Actual","Cum Plan","Cum Actual","Variance"])
+    _ppt_table(s,summ,.55,5.15,12.2,1.45,max_rows=2,font=9)
 
-    def add_chart_slide(title, fig):
-        slide = prs.slides.add_slide(prs.slide_layouts[6])
-        add_title(slide, title)
-        png = make_download_chart(fig, width=1400, height=720)
-        if png:
-            img_stream = BytesIO(png)
-            slide.shapes.add_picture(img_stream, Inches(.65), Inches(1.05), width=Inches(12.0), height=Inches(5.9))
-        return slide
+    def chart_slide(title,fig,subtitle=None):
+        sl=prs.slides.add_slide(prs.slide_layouts[6]);_ppt_title(sl,title,subtitle);png=fig if isinstance(fig,(bytes,bytearray)) else _fig_png(fig,1500,760)
+        if png:sl.shapes.add_picture(BytesIO(png),Inches(.55),Inches(1.75),width=Inches(12.2),height=Inches(5.25))
+        return sl
+    cost_m=_curve_resample(cost_curve,"MS");cost_w=_curve_resample(cost_curve,"W");unit_m=_curve_resample(unit_curve,"MS");unit_w=_curve_resample(unit_curve,"W")
+    for title,fig in [("Cost S-Curve - Monthly",_curve_png(cost_m,"Cost S-Curve - Monthly")),("Cost S-Curve - Weekly",_curve_png(cost_w,"Cost S-Curve - Weekly")),("MHR / Unit S-Curve - Monthly",_curve_png(unit_m,"MHR / Unit S-Curve - Monthly")),("MHR / Unit S-Curve - Weekly",_curve_png(unit_w,"MHR / Unit S-Curve - Weekly")),("Cash Flow - Planned vs Actual",_cashflow_png(cost_m,"Cash Flow - Planned vs Actual"))]:
+        chart_slide(title,fig)
 
-    if not unit_curve.empty:
-        f = go.Figure()
-        f.add_trace(go.Scatter(x=unit_curve["date"], y=unit_curve["cum_planned_pct"], name="MHR Planned", mode="lines"))
-        f.add_trace(go.Scatter(x=unit_curve["date"], y=unit_curve["cum_actual_pct"], name="MHR Actual", mode="lines"))
-        f.update_layout(title="", yaxis_title="Cumulative %", xaxis_title="", template="plotly_white")
-        add_chart_slide("MHR / Unit S-Curve", f)
+    # manpower
+    actual_mp=db_sheet(project_db_sheets,"Actual Manpower");mpw=manpower_plan_weekly.copy() if manpower_plan_weekly is not None else pd.DataFrame()
+    if not mpw.empty:
+        mpw["date"]=pd.to_datetime(mpw["date"],errors="coerce");mpw["actual"]=0.0
+        if not actual_mp.empty and "Date" in actual_mp.columns:
+            a=actual_mp.copy();a["Date"]=pd.to_datetime(a["Date"],errors="coerce");a["Total"]=pd.to_numeric(a.get("Total"),errors="coerce");a=a.dropna(subset=["Date"])
+            aw=a.set_index("Date")["Total"].resample("W").mean().reset_index().rename(columns={"Date":"date","Total":"actual"});mpw=pd.merge(mpw[["date","planned"]],aw,on="date",how="left").fillna(0)
+    chart_slide("Manpower - Planned vs Actual",_manpower_png(mpw,"Manpower - Planned vs Actual"))
 
-    if not cost_curve.empty:
-        f = go.Figure()
-        f.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_planned_pct"], name="Cost Planned", mode="lines"))
-        f.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_actual_pct"], name="Cost Actual", mode="lines"))
-        f.update_layout(title="", yaxis_title="Cumulative %", xaxis_title="", template="plotly_white")
-        add_chart_slide("Cost S-Curve", f)
+    # milestones/schedule
+    ms=active[active.duration_days.fillna(-1)==0].copy().sort_values("finish").head(12);ms["Finish"]=ms.finish.map(fmt_date);ms["TF"]=ms.total_float_days.map(lambda v:"—" if pd.isna(v) else f"{v:.0f} d")
+    sl=prs.slides.add_slide(prs.slide_layouts[6]);_ppt_title(sl,"Milestones & Schedule Health");_ppt_table(sl,ms[["task_code","task_name","Finish","TF"]].rename(columns={"task_code":"ID","task_name":"Milestone"}),.45,1.75,12.4,4.7,max_rows=12,font=8)
 
-        cf = go.Figure()
-        cf.add_bar(x=cost_curve["date"], y=cost_curve["planned"], name="Monthly Planned")
-        cf.add_bar(x=cost_curve["date"], y=cost_curve["actual"], name="Monthly Actual")
-        cf.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_planned"], name="Cumulative Planned", mode="lines+markers", yaxis="y2"))
-        cf.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_actual"], name="Cumulative Actual", mode="lines+markers", yaxis="y2"))
-        cf.update_layout(title="", barmode="group", yaxis_title="Monthly", yaxis2=dict(title="Cumulative", overlaying="y", side="right"), template="plotly_white")
-        add_chart_slide("Cash Flow - Planned vs Actual", cf)
+    # engineering
+    eng=active[active.category.isin(["Prequalification","Shop Drawings","Material Submittals"])].copy().sort_values(["total_float_days","finish"]);eng["Finish"]=eng.finish.map(fmt_date);eng["TF"]=eng.total_float_days.map(lambda v:"—" if pd.isna(v) else f"{v:.0f} d");eng["Status"]=eng.total_float_days.apply(status_from_float)
+    sl=prs.slides.add_slide(prs.slide_layouts[6]);_ppt_title(sl,"Engineering - Major Package Wise","Critical and near-critical PQ / Shop Drawings / Material Submittals");_ppt_table(sl,eng[["package","category","Finish","TF","Status"]].rename(columns={"package":"Package","category":"Stage"}),.35,1.7,12.6,5.25,max_rows=15,font=8)
 
-    if 'mp_chart' in globals() and isinstance(mp_chart, pd.DataFrame) and not mp_chart.empty:
-        mf = px.bar(mp_chart, x="date", y=["planned","actual"], barmode="group", title="")
-        mf.update_layout(yaxis_title="Headcount", template="plotly_white")
-        add_chart_slide("Manpower - Planned vs Actual", mf)
+    # procurement
+    proc=active[active.category=="Procurement"].copy();proc["Action"]=proc.apply(procurement_action,axis=1,dd=data_date);proc["Finish"]=proc.finish.map(fmt_date);proc["TF"]=proc.total_float_days.map(lambda v:"—" if pd.isna(v) else f"{v:.0f} d");proc=proc.sort_values(["total_float_days","finish"])
+    sl=prs.slides.add_slide(prs.slide_layouts[6]);_ppt_title(sl,"Procurement - Priority Actions","Immediate LPO / overdue / delivery risk");_ppt_table(sl,proc[["task_code","task_name","Finish","TF","Action"]].rename(columns={"task_code":"ID","task_name":"Item"}),.3,1.7,12.7,5.25,max_rows=15,font=8)
 
-    # Engineering
-    slide=prs.slides.add_slide(prs.slide_layouts[6]); add_title(slide,"Engineering · Major Package Wise")
-    tb=slide.shapes.add_textbox(Inches(.6),Inches(1.1),Inches(12),Inches(5.8))
-    tf=tb.text_frame; tf.word_wrap=True
-    eng=(curr if curr is not None else base)
-    eng=eng[eng.category.isin(["Prequalification","Shop Drawings","Material Submittals"])].sort_values(["total_float_days","finish"]).head(12)
-    for i,(_,r) in enumerate(eng.iterrows()):
-        p=tf.paragraphs[0] if i==0 else tf.add_paragraph()
-        p.text=f"{r.package[:45]}  |  {r.category}  |  Finish {fmt_date(r.finish)}  |  TF {r.total_float_days:.0f} d"
-        p.font.size=Pt(13); p.font.color.rgb=RGBColor(214,40,40) if pd.notna(r.total_float_days) and r.total_float_days<0 else RGBColor(18,18,18)
+    # lookahead
+    la=date_window(active,data_date,lookahead_weeks).copy().head(16);la["Start"]=la.start.map(fmt_date);la["Finish"]=la.finish.map(fmt_date);la["TF"]=la.total_float_days.map(lambda v:"—" if pd.isna(v) else f"{v:.0f} d")
+    sl=prs.slides.add_slide(prs.slide_layouts[6]);_ppt_title(sl,f"{lookahead_weeks}-Week Lookahead",f"{fmt_date(data_date)} to {fmt_date(data_date+pd.Timedelta(weeks=lookahead_weeks))}");_ppt_table(sl,la[["task_code","task_name","Start","Finish","TF"]].rename(columns={"task_code":"ID","task_name":"Activity"}),.3,1.7,12.7,5.25,max_rows=16,font=7.5)
 
-    # Procurement
-    slide=prs.slides.add_slide(prs.slide_layouts[6]); add_title(slide,"Procurement · Priority Actions")
-    tb=slide.shapes.add_textbox(Inches(.6),Inches(1.1),Inches(12),Inches(5.8))
-    tf=tb.text_frame
-    proc=(curr if curr is not None else base)
-    proc=proc[proc.category=="Procurement"].copy(); proc["Action"]=proc.apply(procurement_action,axis=1,dd=data_date)
-    proc=proc.sort_values(["total_float_days","finish"]).head(12)
-    for i,(_,r) in enumerate(proc.iterrows()):
-        p=tf.paragraphs[0] if i==0 else tf.add_paragraph()
-        p.text=f"{r.task_code} · {r.task_name[:60]} · {r.Action} · TF {r.total_float_days:.0f} d"
-        p.font.size=Pt(13); p.font.color.rgb=RGBColor(214,40,40) if pd.notna(r.total_float_days) and r.total_float_days<0 else RGBColor(18,18,18)
+    # risks + decisions
+    risks=db_sheet(project_db_sheets,"Risks & Actions");sl=prs.slides.add_slide(prs.slide_layouts[6]);_ppt_title(sl,"Key Risks, Actions & Decisions Required");_ppt_table(sl,risks,.35,1.7,12.6,3.7,max_rows=8,font=8)
+    txt=_db_text("Client / Consultant Decisions Required");tb=sl.shapes.add_textbox(Inches(.55),Inches(5.65),Inches(12.0),Inches(1.0));p=tb.text_frame.paragraphs[0];p.text="DECISIONS REQUIRED";p.font.bold=True;p.font.size=Pt(11);p.font.color.rgb=RGBColor(7,121,92);q=tb.text_frame.add_paragraph();q.text=txt;q.font.size=Pt(10)
 
-    # Lookahead
-    slide=prs.slides.add_slide(prs.slide_layouts[6]); add_title(slide,f"{lookahead_weeks}-Week Lookahead · From {fmt_date(data_date)}")
-    tb=slide.shapes.add_textbox(Inches(.6),Inches(1.1),Inches(12),Inches(5.8))
-    tf=tb.text_frame
-    la=date_window(curr if curr is not None else base,data_date,lookahead_weeks).head(15)
-    for i,(_,r) in enumerate(la.iterrows()):
-        p=tf.paragraphs[0] if i==0 else tf.add_paragraph()
-        p.text=f"{r.task_code} · {r.task_name[:70]} · {fmt_date(r.start)} → {fmt_date(r.finish)} · TF {r.total_float_days:.0f} d"
-        p.font.size=Pt(12); p.font.color.rgb=RGBColor(214,40,40) if pd.notna(r.total_float_days) and r.total_float_days<0 else RGBColor(18,18,18)
+    # photos
+    if progress_photos:
+        for start in range(0,min(len(progress_photos),8),4):
+            sl=prs.slides.add_slide(prs.slide_layouts[6]);_ppt_title(sl,"Progress Photos")
+            coords=[(.45,1.65),(6.9,1.65),(.45,4.4),(6.9,4.4)]
+            for pfile,(x,y) in zip(progress_photos[start:start+4],coords):
+                try:sl.shapes.add_picture(BytesIO(pfile.getvalue()),Inches(x),Inches(y),width=Inches(5.9),height=Inches(2.35))
+                except Exception:pass
 
-    buf=BytesIO(); prs.save(buf); buf.seek(0); return buf.getvalue()
+    out=BytesIO();prs.save(out);out.seek(0);return out.getvalue()
+
 
 with tabs[11]:
     st.markdown('<div class="section-title">Report Center</div>', unsafe_allow_html=True)
     st.write("Generate management outputs from the same data and Data Date shown in the dashboard.")
-    c1,c2=st.columns(2)
+    c1,c2,c3=st.columns(3)
     with c1:
         try:
             pdf=make_pdf()
-            st.download_button("Generate Weekly PDF Report",pdf,
-                               f"JRD_Weekly_Report_{data_date.strftime('%Y%m%d')}.pdf",
+            st.download_button("Generate A3 Weekly PDF Report",pdf,
+                               f"JRD_WPR_{data_date.strftime('%Y%m%d')}.pdf",
                                "application/pdf",use_container_width=True)
         except Exception as e:
             st.error(f"PDF generation error: {e}")
@@ -1269,6 +1624,13 @@ with tabs[11]:
                                use_container_width=True)
         except Exception as e:
             st.error(f"PowerPoint generation error: {e}")
+    with c3:
+        updated_db=make_updated_project_database()
+        if updated_db:
+            st.download_button("Download Updated Project Database",updated_db,
+                               f"JRD_Project_Database_{data_date.strftime('%Y%m%d')}.xlsx",
+                               "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True)
 
 st.markdown("---")
-st.caption("JRD Project Controls Hub · v0.4.1 CLIENT REPORTING · DDDC branded · Negative float shown in red as delay indication")
+st.caption("JRD Project Controls Hub · v0.5 WPR MASTER REPORTING · DDDC branded · Negative float shown in red as delay indication")
