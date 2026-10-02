@@ -57,8 +57,33 @@ html, body, [class*="css"] {{ font-family: Poppins, Arial, sans-serif; }}
 div[data-testid="stMetric"] {{
   border: 1px solid rgba(209,211,212,.35);
   border-left: 5px solid {BRAND_GREEN};
-  padding: 12px 14px; border-radius: 10px;
+  padding: 14px 16px; border-radius: 10px;
   background: rgba(247,247,245,.04);
+  min-height: 112px;
+  overflow: visible;
+}}
+[data-testid="stMetricLabel"] p {{
+  font-size: 0.82rem !important;
+  line-height: 1.15 !important;
+  white-space: normal !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+}}
+[data-testid="stMetricValue"] {{
+  font-size: clamp(1.55rem, 2vw, 2.15rem) !important;
+  line-height: 1.05 !important;
+  white-space: nowrap !important;
+  overflow: visible !important;
+}}
+[data-testid="stDataFrame"] {{
+  font-size: 0.9rem;
+}}
+[data-testid="stDataFrame"] [role="columnheader"] {{
+  font-weight: 700;
+}}
+@media (max-width: 1450px) {{
+  [data-testid="stMetricValue"] {{ font-size: 1.55rem !important; }}
+  [data-testid="stMetricLabel"] p {{ font-size: 0.76rem !important; }}
 }}
 .kpi-title {{font-size:.74rem; opacity:.72; text-transform:uppercase; letter-spacing:.04em;}}
 .kpi-big {{font-size:1.65rem; font-weight:700;}}
@@ -265,14 +290,194 @@ def timephase_assign(assign_df, val_col, data_date, freq="W"):
     return out
 
 def merge_plan_actual(plan, actual, freq, planned_name="planned", actual_name="actual"):
-    if plan.empty and actual.empty: return pd.DataFrame()
-    out = pd.merge(plan, actual, on="date", how="outer").sort_values("date").fillna(0)
-    out["cum_planned"] = out.get(planned_name,0).cumsum()
-    out["cum_actual"] = out.get(actual_name,0).cumsum()
-    pt=out.get(planned_name,0).sum(); at=out.get(actual_name,0).sum()
-    out["cum_planned_pct"]=np.where(pt, out["cum_planned"]/pt*100,0)
-    out["cum_actual_pct"]=np.where(pt, out["cum_actual"]/pt*100,0)
-    return out
+    # Robust handling when only Planned or only Actual data exists.
+    # Always preserve a date axis and create the missing series as zero.
+    if (plan is None or plan.empty) and (actual is None or actual.empty):
+        return pd.DataFrame(columns=["date", planned_name, actual_name,
+                                     "cum_planned", "cum_actual",
+                                     "cum_planned_pct", "cum_actual_pct"])
+
+    if plan is None or plan.empty:
+        out = actual.copy()
+        if "date" not in out.columns:
+            return pd.DataFrame()
+        if actual_name not in out.columns:
+            value_cols = [c for c in out.columns if c != "date"]
+            if value_cols:
+                out = out.rename(columns={value_cols[0]: actual_name})
+        out[planned_name] = 0.0
+
+    elif actual is None or actual.empty:
+        out = plan.copy()
+        if "date" not in out.columns:
+            return pd.DataFrame()
+        if planned_name not in out.columns:
+            value_cols = [c for c in out.columns if c != "date"]
+            if value_cols:
+                out = out.rename(columns={value_cols[0]: planned_name})
+        out[actual_name] = 0.0
+
+    else:
+        out = pd.merge(plan, actual, on="date", how="outer")
+
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out = out.dropna(subset=["date"]).sort_values("date").fillna(0)
+
+    if planned_name not in out.columns:
+        out[planned_name] = 0.0
+    if actual_name not in out.columns:
+        out[actual_name] = 0.0
+
+    out[planned_name] = pd.to_numeric(out[planned_name], errors="coerce").fillna(0.0)
+    out[actual_name] = pd.to_numeric(out[actual_name], errors="coerce").fillna(0.0)
+
+    out["cum_planned"] = out[planned_name].cumsum()
+    out["cum_actual"] = out[actual_name].cumsum()
+
+    pt = out[planned_name].sum()
+    out["cum_planned_pct"] = np.where(pt != 0, out["cum_planned"] / pt * 100, 0.0)
+    # Actual progress percentage is measured against the total planned basis.
+    out["cum_actual_pct"] = np.where(pt != 0, out["cum_actual"] / pt * 100, 0.0)
+
+    return out.reset_index(drop=True)
+
+
+def read_any_excel(uploaded):
+    """Return all sheets as raw dataframes. Handles Streamlit UploadedFile or local path."""
+    if uploaded is None:
+        return {}
+    try:
+        xls = pd.ExcelFile(uploaded)
+        return {s: pd.read_excel(xls, sheet_name=s, header=None) for s in xls.sheet_names}
+    except Exception:
+        return {}
+
+def _is_date_like(x):
+    if pd.isna(x):
+        return False
+    if isinstance(x, (pd.Timestamp, datetime, date)):
+        return True
+    try:
+        y = pd.to_datetime(x, errors="coerce")
+        return pd.notna(y) and 1990 <= y.year <= 2050
+    except Exception:
+        return False
+
+def parse_planned_curve_excel(uploaded, preferred=("PLANNED", "W"), default_freq="W"):
+    """
+    Parses common P6 planned progress Excel curves:
+    - Sheets like PLANNED PROGRESS W/M where a date row is followed by a values row.
+    - Sheets like WEEKLY/MONTHLY where row contains dates and following row contains spread values.
+    Output columns: date, planned, cum_planned, cum_planned_pct
+    """
+    sheets = read_any_excel(uploaded)
+    if not sheets:
+        return pd.DataFrame(columns=["date","planned","cum_planned","cum_planned_pct"])
+
+    scored = []
+    pref = [p.upper() for p in preferred]
+    for sname, df in sheets.items():
+        sn = sname.upper()
+        sheet_bonus = sum(10 for p in pref if p in sn)
+        if df.empty:
+            continue
+        for r in range(min(len(df), 60)):
+            row = df.iloc[r]
+            date_cols = [c for c, v in row.items() if _is_date_like(v)]
+            if len(date_cols) < 3:
+                continue
+            for offset in range(1, 6):
+                if r + offset >= len(df):
+                    continue
+                vrow = df.iloc[r + offset]
+                vals = pd.to_numeric(vrow[date_cols], errors="coerce")
+                numeric_count = vals.notna().sum()
+                positive_sum = vals.fillna(0).abs().sum()
+                if numeric_count >= max(3, len(date_cols) * 0.45) and positive_sum > 0:
+                    score = sheet_bonus + len(date_cols) + numeric_count - offset
+                    scored.append((score, sname, r, r + offset, date_cols))
+    if not scored:
+        return pd.DataFrame(columns=["date","planned","cum_planned","cum_planned_pct"])
+
+    scored.sort(reverse=True, key=lambda x: x[0])
+    _, sname, date_row, value_row, date_cols = scored[0]
+    df = sheets[sname]
+    dates = pd.to_datetime(df.loc[date_row, date_cols], errors="coerce")
+    values = pd.to_numeric(df.loc[value_row, date_cols], errors="coerce").fillna(0.0)
+    out = pd.DataFrame({"date": dates.values, "planned": values.values})
+    out = out.dropna(subset=["date"]).sort_values("date")
+    out = out.groupby("date", as_index=False)["planned"].sum()
+    out["cum_planned"] = out["planned"].cumsum()
+    total = out["planned"].sum()
+    out["cum_planned_pct"] = np.where(total != 0, out["cum_planned"] / total * 100, 0.0)
+    return out.reset_index(drop=True)
+
+def parse_manpower_plan_excel(uploaded, monthly=False):
+    sheets = read_any_excel(uploaded)
+    if not sheets:
+        return pd.DataFrame(columns=["date","planned"])
+    target_words = ["MONTHLY MPH", "MONTHLY"] if monthly else ["WEEKLY MPH", "WEEKLY"]
+    candidates=[]
+    for sname, df in sheets.items():
+        sn=sname.upper()
+        if not any(w in sn for w in target_words):
+            continue
+        for r in range(min(len(df), 25)):
+            label = str(df.iloc[r,0]).upper() if df.shape[1] else ""
+            if "PLANNED MANPOWER" in label:
+                date_row = 0
+                date_cols=[c for c,v in df.iloc[date_row].items() if _is_date_like(v)]
+                if len(date_cols) >= 3:
+                    vals=pd.to_numeric(df.loc[r,date_cols],errors="coerce").fillna(0.0)
+                    out=pd.DataFrame({"date":pd.to_datetime(df.loc[date_row,date_cols],errors="coerce").values,
+                                      "planned":vals.values})
+                    out=out.dropna(subset=["date"]).sort_values("date")
+                    candidates.append((len(date_cols), out))
+    if candidates:
+        candidates.sort(reverse=True, key=lambda x:x[0])
+        return candidates[0][1].reset_index(drop=True)
+    pc=parse_planned_curve_excel(uploaded, preferred=("MPH","WEEKLY" if not monthly else "MONTHLY"))
+    return pc[["date","planned"]] if not pc.empty else pd.DataFrame(columns=["date","planned"])
+
+def actual_curve_from_update(task, value_col, data_date, freq="W"):
+    if task is None or task.empty or value_col not in task.columns:
+        return pd.DataFrame(columns=["date","actual"])
+    d=task.dropna(subset=[value_col]).copy()
+    d=d[d[value_col].fillna(0)!=0]
+    if d.empty or "actual_start" not in d.columns:
+        return pd.DataFrame(columns=["date","actual"])
+    rows=[]
+    for _,r in d.iterrows():
+        s=r.get("actual_start", pd.NaT)
+        f=r.get("actual_finish", pd.NaT)
+        if pd.isna(s):
+            continue
+        if pd.isna(f):
+            f=data_date
+        dates=pd.date_range(pd.Timestamp(s).normalize(), pd.Timestamp(f).normalize(), freq="D")
+        if len(dates)==0:
+            continue
+        daily=float(r[value_col])/len(dates)
+        rows.append(pd.DataFrame({"date":dates,"actual":daily}))
+    if not rows:
+        return pd.DataFrame(columns=["date","actual"])
+    out=pd.concat(rows).groupby("date",as_index=False)["actual"].sum()
+    return out.set_index("date").resample(freq)["actual"].sum().reset_index()
+
+def combine_planned_actual(planned_curve, actual_curve):
+    pc = planned_curve.copy() if planned_curve is not None else pd.DataFrame()
+    ac = actual_curve.copy() if actual_curve is not None else pd.DataFrame()
+    if not pc.empty:
+        pc = pc[["date","planned"]].copy()
+    if not ac.empty:
+        ac = ac[["date","actual"]].copy()
+    return merge_plan_actual(pc, ac, "X", "planned", "actual")
+
+def make_download_chart(fig, width=1200, height=620):
+    try:
+        return fig.to_image(format="png", width=width, height=height, scale=2)
+    except Exception:
+        return None
 
 def style_float(v):
     if pd.isna(v): return ""
@@ -323,11 +528,16 @@ def fig_to_png(fig):
 # Sidebar inputs
 # ------------------------------------------------------------------
 st.sidebar.title("Project Controls Hub")
-st.sidebar.caption("v0.3 FINAL · JRD Executive Controls")
+st.sidebar.caption("v0.4.1 CLIENT REPORTING · JRD Executive Controls")
 
 baseline_file = st.sidebar.file_uploader("1. Approved Baseline", type=["xlsx"], key="baseline")
 update_file = st.sidebar.file_uploader("2. Current Update", type=["xlsx"], key="update")
-resource_file = st.sidebar.file_uploader("3. Resource / Cost Export", type=["xlsx"], key="resource")
+resource_file = st.sidebar.file_uploader("3. Resource / Cost Export for Actuals", type=["xlsx"], key="resource")
+
+st.sidebar.markdown("### Planned Curves")
+planned_cost_file = st.sidebar.file_uploader("4. Planned Cost / Cash Flow Excel", type=["xlsx"], key="planned_cost")
+planned_unit_file = st.sidebar.file_uploader("5. Planned Unit / MHR Excel", type=["xlsx"], key="planned_unit")
+planned_manpower_file = st.sidebar.file_uploader("6. Planned Manpower Histogram Excel", type=["xlsx"], key="planned_mph")
 
 today_default = date.today()
 data_date_input = st.sidebar.date_input("Data Date", value=today_default, format="DD/MM/YYYY")
@@ -411,20 +621,48 @@ elapsed_days = max(0,(data_date.normalize()-bf["start"].normalize()).days) if pd
 remaining_days = max(0,(forecast_finish.normalize()-data_date.normalize()).days) if pd.notna(forecast_finish) else np.nan
 elapsed_pct = elapsed_days/duration_days*100 if duration_days and duration_days>0 else np.nan
 
-# Build resource curves
-cost_curve=pd.DataFrame(); unit_curve=pd.DataFrame()
-if not assign.empty:
-    pc=timephase_assign(assign,"planned_cost",data_date,"MS") if "planned_cost" in assign.columns else pd.DataFrame()
-    ac=timephase_assign(assign,"actual_cost",data_date,"MS") if "actual_cost" in assign.columns else pd.DataFrame()
-    if not pc.empty: pc=pc.rename(columns={"planned_cost":"planned"})
-    if not ac.empty: ac=ac.rename(columns={"actual_cost":"actual"})
-    cost_curve=merge_plan_actual(pc,ac,"MS","planned","actual") if (not pc.empty or not ac.empty) else pd.DataFrame()
+# Build curves
+# Planned values come from user-uploaded planned sheets when provided.
+# Actual values come from each update/resource export; missing actuals are shown as zero rather than fabricated.
+cost_curve=pd.DataFrame(); unit_curve=pd.DataFrame(); manpower_plan_weekly=pd.DataFrame(); manpower_plan_monthly=pd.DataFrame()
 
-    pu=timephase_assign(assign,"planned_units",data_date,"W") if "planned_units" in assign.columns else pd.DataFrame()
-    au=timephase_assign(assign,"actual_units",data_date,"W") if "actual_units" in assign.columns else pd.DataFrame()
-    if not pu.empty: pu=pu.rename(columns={"planned_units":"planned"})
-    if not au.empty: au=au.rename(columns={"actual_units":"actual"})
-    unit_curve=merge_plan_actual(pu,au,"W","planned","actual") if (not pu.empty or not au.empty) else pd.DataFrame()
+# Planned Cost: user sheet has priority, resource assignment planned cost is fallback.
+planned_cost_curve = parse_planned_curve_excel(planned_cost_file, preferred=("PLANNED","COST","W"))
+if planned_cost_curve.empty and not assign.empty and "planned_cost" in assign.columns:
+    pc=timephase_assign(assign,"planned_cost",data_date,"MS")
+    if not pc.empty:
+        planned_cost_curve=pc.rename(columns={"planned_cost":"planned"})
+
+# Actual Cost: from resource/cost export; fallback from current update actual cost fields if present.
+actual_cost_curve = pd.DataFrame(columns=["date","actual"])
+if not assign.empty and "actual_cost" in assign.columns:
+    ac=timephase_assign(assign,"actual_cost",data_date,"MS")
+    if not ac.empty:
+        actual_cost_curve=ac.rename(columns={"actual_cost":"actual"})
+if actual_cost_curve.empty and curr is not None:
+    actual_cost_curve=actual_curve_from_update(curr,"actual_cost",data_date,"MS")
+cost_curve=combine_planned_actual(planned_cost_curve, actual_cost_curve)
+
+# Planned Unit/MHR: user sheet has priority, resource assignment planned units is fallback.
+planned_unit_curve = parse_planned_curve_excel(planned_unit_file, preferred=("PLANNED","UNIT","MHR","W"))
+if planned_unit_curve.empty and not assign.empty and "planned_units" in assign.columns:
+    pu=timephase_assign(assign,"planned_units",data_date,"W")
+    if not pu.empty:
+        planned_unit_curve=pu.rename(columns={"planned_units":"planned"})
+
+# Actual Unit/MHR: from resource assignments; fallback from current update actual_units if present.
+actual_unit_curve = pd.DataFrame(columns=["date","actual"])
+if not assign.empty and "actual_units" in assign.columns:
+    au=timephase_assign(assign,"actual_units",data_date,"W")
+    if not au.empty:
+        actual_unit_curve=au.rename(columns={"actual_units":"actual"})
+if actual_unit_curve.empty and curr is not None:
+    actual_unit_curve=actual_curve_from_update(curr,"actual_units",data_date,"W")
+unit_curve=combine_planned_actual(planned_unit_curve, actual_unit_curve)
+
+# Planned manpower from separate manpower histogram; actual manpower entered manually in app.
+manpower_plan_weekly = parse_manpower_plan_excel(planned_manpower_file, monthly=False)
+manpower_plan_monthly = parse_manpower_plan_excel(planned_manpower_file, monthly=True)
 
 # Executive progress KPIs
 def progress_from_curve(curve):
@@ -448,7 +686,7 @@ tabs = st.tabs([
 # ------------------------------------------------------------------
 with tabs[0]:
     st.markdown('<div class="section-title">Executive Project Summary</div>', unsafe_allow_html=True)
-    a,b = st.columns([1,2])
+    a,b = st.columns([1.15,2.35], gap="large")
     with a:
         summary = pd.DataFrame({
             "Description":["Contract Commencement","Contract Completion","Forecast Completion","Total Duration (days)",
@@ -461,15 +699,16 @@ with tabs[0]:
                       fmt_date(data_date),
                       "Behind Programme" if pd.notna(forecast_move) and forecast_move>0 else "On / Ahead"]
         })
-        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.dataframe(summary, use_container_width=True, hide_index=True, height=390)
     with b:
-        c=st.columns(6)
-        c[0].metric("Forecast Movement", f"{forecast_move:+.0f} d" if pd.notna(forecast_move) else "—")
-        c[1].metric("Critical Activities", f"{bf['critical']:,}")
-        c[2].metric("Negative Float", f"{bf['negative']:,}")
-        c[3].metric("MHR Planned", f"{mhr_plan:.2f}%" if pd.notna(mhr_plan) else "N/A")
-        c[4].metric("MHR Actual", f"{mhr_actual:.2f}%" if pd.notna(mhr_actual) else "N/A")
-        c[5].metric("Cost Actual", f"{cost_actual:.2f}%" if pd.notna(cost_actual) else "N/A")
+        r1=st.columns(3, gap="medium")
+        r1[0].metric("Forecast Movement", f"{forecast_move:+.0f} d" if pd.notna(forecast_move) else "—")
+        r1[1].metric("Critical Activities", f"{bf['critical']:,}")
+        r1[2].metric("Negative Float", f"{bf['negative']:,}")
+        r2=st.columns(3, gap="medium")
+        r2[0].metric("MHR Planned", f"{mhr_plan:.2f}%" if pd.notna(mhr_plan) else "N/A")
+        r2[1].metric("MHR Actual", f"{mhr_actual:.2f}%" if pd.notna(mhr_actual) else "N/A")
+        r2[2].metric("Cost Actual", f"{cost_actual:.2f}%" if pd.notna(cost_actual) else "N/A")
 
         # Progress summary tables
         ptab = pd.DataFrame([
@@ -481,7 +720,7 @@ with tabs[0]:
                 lambda v: f"color:{BRAND_RED};font-weight:700" if isinstance(v,(float,np.floating)) and v<0 else "",
                 subset=["Variance %"]
             ),
-            use_container_width=True, hide_index=True
+            use_container_width=True, hide_index=True, height=145
         )
 
     c1,c2=st.columns(2)
@@ -490,7 +729,7 @@ with tabs[0]:
         dd=pd.DataFrame({"Metric":["Original Duration","At Completion Duration","Time Elapsed"],
                          "Days":[duration_days, duration_days+(forecast_move if pd.notna(forecast_move) else 0), elapsed_days]})
         fig=px.bar(dd,x="Days",y="Metric",orientation="h",text="Days",title="Project Duration")
-        fig.update_layout(height=320,xaxis_title="Days",yaxis_title="")
+        fig.update_layout(height=360,xaxis_title="Days",yaxis_title="", margin=dict(l=10,r=10,t=55,b=25))
         st.plotly_chart(fig,use_container_width=True)
     with c2:
         # Management alerts
@@ -610,22 +849,51 @@ with tabs[4]:
 # Manpower
 # ------------------------------------------------------------------
 with tabs[5]:
-    st.markdown('<div class="section-title">Manhours & Manpower</div>', unsafe_allow_html=True)
-    if unit_curve.empty:
-        st.warning("Planned/Actual Labor Units are required.")
+    st.markdown('<div class="section-title">Manpower Histogram · Planned from Excel / Actual Manual</div>', unsafe_allow_html=True)
+    st.caption("Planned manpower comes from the manpower histogram Excel. Actual manpower is entered from the project timesheet.")
+    if manpower_plan_weekly.empty:
+        st.warning("Upload the Planned Manpower Histogram Excel to activate planned manpower charts.")
+        mp = pd.DataFrame({"date": pd.date_range(data_date, periods=8, freq="W"), "planned": 0.0})
     else:
-        unit_curve["planned_manpower"]=unit_curve["planned"]/(hours_per_day*days_per_week)
-        unit_curve["actual_manpower"]=unit_curve["actual"]/(hours_per_day*days_per_week)
-        c1,c2=st.columns(2)
-        with c1:
-            fig=px.bar(unit_curve,x="date",y=["planned","actual"],barmode="group",title="Weekly Planned vs Actual Manhours")
-            fig.update_layout(height=430,xaxis_title="",yaxis_title="Manhours / Labor Units")
-            st.plotly_chart(fig,use_container_width=True)
-        with c2:
-            fig=px.bar(unit_curve,x="date",y=["planned_manpower","actual_manpower"],barmode="group",title="Weekly Planned vs Actual Manpower")
-            fig.update_layout(height=430,xaxis_title="",yaxis_title="Headcount")
-            st.plotly_chart(fig,use_container_width=True)
-        st.caption(f"Headcount conversion: weekly labor hours ÷ ({hours_per_day:g} h/day × {days_per_week:g} days/week).")
+        mp = manpower_plan_weekly.copy()
+
+    actual_seed = mp[["date","planned"]].copy()
+    actual_seed["actual"] = 0.0
+    actual_seed["date"] = pd.to_datetime(actual_seed["date"]).dt.date
+    st.markdown("### Actual Manpower Input from Timesheet")
+    edited = st.data_editor(
+        actual_seed,
+        column_config={
+            "date": st.column_config.DateColumn("Week / Month"),
+            "planned": st.column_config.NumberColumn("Planned Manpower", disabled=True, format="%.0f"),
+            "actual": st.column_config.NumberColumn("Actual Manpower", min_value=0.0, step=1.0, format="%.0f"),
+        },
+        hide_index=True,
+        use_container_width=True,
+        key="actual_manpower_editor"
+    )
+    mp_chart = edited.copy()
+    mp_chart["date"] = pd.to_datetime(mp_chart["date"])
+    mp_chart["variance"] = mp_chart["actual"] - mp_chart["planned"]
+
+    c1,c2=st.columns(2)
+    with c1:
+        fig=px.bar(mp_chart,x="date",y=["planned","actual"],barmode="group",title="Weekly/Monthly Planned vs Actual Manpower")
+        fig.update_layout(height=430,xaxis_title="",yaxis_title="Headcount")
+        st.plotly_chart(fig,use_container_width=True)
+    with c2:
+        fig=px.bar(mp_chart,x="date",y="variance",title="Manpower Variance")
+        fig.update_layout(height=430,xaxis_title="",yaxis_title="Actual - Planned")
+        st.plotly_chart(fig,use_container_width=True)
+
+    if not unit_curve.empty:
+        st.markdown("### MHR / Labor Units")
+        unit_curve["planned_manpower_equivalent"]=unit_curve["planned"]/(hours_per_day*days_per_week)
+        unit_curve["actual_manpower_equivalent"]=unit_curve["actual"]/(hours_per_day*days_per_week)
+        fig=px.bar(unit_curve,x="date",y=["planned","actual"],barmode="group",title="Weekly Planned vs Actual Manhours / Labor Units")
+        fig.update_layout(height=380,xaxis_title="",yaxis_title="Manhours / Labor Units")
+        st.plotly_chart(fig,use_container_width=True)
+        st.caption(f"Equivalent headcount conversion: weekly labor hours ÷ ({hours_per_day:g} h/day × {days_per_week:g} days/week).")
 
 # ------------------------------------------------------------------
 # Milestones
@@ -719,6 +987,16 @@ def make_pdf():
     story=[]
     if COVER_IMG.exists():
         story.append(RLImage(str(COVER_IMG),width=255*mm,height=120*mm))
+    logo_cells = []
+    for lp in [ALTA_LOGO, DDDC_LOGO, DAR_LOGO]:
+        if lp.exists():
+            logo_cells.append(RLImage(str(lp), width=32*mm, height=15*mm))
+        else:
+            logo_cells.append("")
+    if logo_cells:
+        lt = Table([logo_cells], colWidths=[65*mm,65*mm,65*mm])
+        lt.setStyle(TableStyle([("ALIGN",(0,0),(-1,-1),"CENTER"),("VALIGN",(0,0),(-1,-1),"MIDDLE")]))
+        story.append(Spacer(1,6)); story.append(lt)
     story.append(Spacer(1,6))
     story.append(Paragraph("JUMEIRAH RETAIL DEVELOPMENT",title))
     story.append(Paragraph("Owner / Employer: ALTA &nbsp;&nbsp; | &nbsp;&nbsp; Contractor: DDDC &nbsp;&nbsp; | &nbsp;&nbsp; Consultant: DAR",body))
@@ -744,6 +1022,41 @@ def make_pdf():
         ("FONTNAME",(2,0),(2,-1),"Helvetica-Bold"),
     ]))
     story.append(t); story.append(Spacer(1,8))
+
+    # Management charts from dashboard
+    chart_items = []
+    if not unit_curve.empty:
+        f = go.Figure()
+        f.add_trace(go.Scatter(x=unit_curve["date"], y=unit_curve["cum_planned_pct"], name="MHR Planned", mode="lines"))
+        f.add_trace(go.Scatter(x=unit_curve["date"], y=unit_curve["cum_actual_pct"], name="MHR Actual", mode="lines"))
+        f.update_layout(title="MHR / Unit S-Curve", height=420, yaxis_title="Cumulative %", xaxis_title="")
+        chart_items.append(f)
+    if not cost_curve.empty:
+        f = go.Figure()
+        f.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_planned_pct"], name="Cost Planned", mode="lines"))
+        f.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_actual_pct"], name="Cost Actual", mode="lines"))
+        f.update_layout(title="Cost S-Curve", height=420, yaxis_title="Cumulative %", xaxis_title="")
+        chart_items.append(f)
+        cf = go.Figure()
+        cf.add_bar(x=cost_curve["date"], y=cost_curve["planned"], name="Monthly Planned")
+        cf.add_bar(x=cost_curve["date"], y=cost_curve["actual"], name="Monthly Actual")
+        cf.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_planned"], name="Cumulative Planned", mode="lines+markers", yaxis="y2"))
+        cf.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_actual"], name="Cumulative Actual", mode="lines+markers", yaxis="y2"))
+        cf.update_layout(title="Cash Flow - Planned vs Actual", barmode="group", height=420, yaxis_title="Monthly", yaxis2=dict(title="Cumulative", overlaying="y", side="right"))
+        chart_items.append(cf)
+    if 'mp_chart' in globals() and isinstance(mp_chart, pd.DataFrame) and not mp_chart.empty:
+        mf = px.bar(mp_chart, x="date", y=["planned","actual"], barmode="group", title="Manpower - Planned vs Actual")
+        mf.update_layout(height=420, yaxis_title="Headcount")
+        chart_items.append(mf)
+
+    if chart_items:
+        story.append(PageBreak())
+        story.append(Paragraph("Progress Charts", h))
+        for ch in chart_items:
+            png = make_download_chart(ch, width=1200, height=620)
+            if png:
+                story.append(RLImage(BytesIO(png), width=210*mm, height=108*mm))
+                story.append(Spacer(1,6))
 
     # Negative float table
     story.append(Paragraph("Schedule Risk / Negative Float",h))
@@ -839,6 +1152,12 @@ def make_pptx():
     tb=slide.shapes.add_textbox(Inches(.6),Inches(4.6),Inches(5.4),Inches(1.4))
     tf=tb.text_frame; p=tf.paragraphs[0]; p.text="JUMEIRAH RETAIL\nDEVELOPMENT"; p.font.size=Pt(30); p.font.bold=True; p.font.color.rgb=RGBColor(247,247,245)
     p2=tf.add_paragraph(); p2.text=f"Data Date: {fmt_date(data_date)}"; p2.font.size=Pt(14); p2.font.color.rgb=RGBColor(209,211,212)
+    # Logos on cover
+    logo_x = 0.7
+    for lp in [ALTA_LOGO, DDDC_LOGO, DAR_LOGO]:
+        if lp.exists():
+            slide.shapes.add_picture(str(lp), Inches(logo_x), Inches(0.35), width=Inches(1.35), height=Inches(0.55))
+            logo_x += 1.55
 
     # executive
     slide=prs.slides.add_slide(prs.slide_layouts[6]); add_title(slide,"Executive Project Summary")
@@ -857,6 +1176,42 @@ def make_pptx():
         p=tf.paragraphs[0]; p.text=title; p.font.size=Pt(11); p.font.color.rgb=RGBColor(18,18,18)
         q=tf.add_paragraph(); q.text=val; q.font.size=Pt(24); q.font.bold=True; q.font.color.rgb=RGBColor(214,40,40) if ("Movement" in title and pd.notna(forecast_move) and forecast_move>0) or title=="Negative Float" else RGBColor(7,121,92)
         x+=2.45
+
+    def add_chart_slide(title, fig):
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        add_title(slide, title)
+        png = make_download_chart(fig, width=1400, height=720)
+        if png:
+            img_stream = BytesIO(png)
+            slide.shapes.add_picture(img_stream, Inches(.65), Inches(1.05), width=Inches(12.0), height=Inches(5.9))
+        return slide
+
+    if not unit_curve.empty:
+        f = go.Figure()
+        f.add_trace(go.Scatter(x=unit_curve["date"], y=unit_curve["cum_planned_pct"], name="MHR Planned", mode="lines"))
+        f.add_trace(go.Scatter(x=unit_curve["date"], y=unit_curve["cum_actual_pct"], name="MHR Actual", mode="lines"))
+        f.update_layout(title="", yaxis_title="Cumulative %", xaxis_title="", template="plotly_white")
+        add_chart_slide("MHR / Unit S-Curve", f)
+
+    if not cost_curve.empty:
+        f = go.Figure()
+        f.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_planned_pct"], name="Cost Planned", mode="lines"))
+        f.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_actual_pct"], name="Cost Actual", mode="lines"))
+        f.update_layout(title="", yaxis_title="Cumulative %", xaxis_title="", template="plotly_white")
+        add_chart_slide("Cost S-Curve", f)
+
+        cf = go.Figure()
+        cf.add_bar(x=cost_curve["date"], y=cost_curve["planned"], name="Monthly Planned")
+        cf.add_bar(x=cost_curve["date"], y=cost_curve["actual"], name="Monthly Actual")
+        cf.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_planned"], name="Cumulative Planned", mode="lines+markers", yaxis="y2"))
+        cf.add_trace(go.Scatter(x=cost_curve["date"], y=cost_curve["cum_actual"], name="Cumulative Actual", mode="lines+markers", yaxis="y2"))
+        cf.update_layout(title="", barmode="group", yaxis_title="Monthly", yaxis2=dict(title="Cumulative", overlaying="y", side="right"), template="plotly_white")
+        add_chart_slide("Cash Flow - Planned vs Actual", cf)
+
+    if 'mp_chart' in globals() and isinstance(mp_chart, pd.DataFrame) and not mp_chart.empty:
+        mf = px.bar(mp_chart, x="date", y=["planned","actual"], barmode="group", title="")
+        mf.update_layout(yaxis_title="Headcount", template="plotly_white")
+        add_chart_slide("Manpower - Planned vs Actual", mf)
 
     # Engineering
     slide=prs.slides.add_slide(prs.slide_layouts[6]); add_title(slide,"Engineering · Major Package Wise")
@@ -916,4 +1271,4 @@ with tabs[11]:
             st.error(f"PowerPoint generation error: {e}")
 
 st.markdown("---")
-st.caption("JRD Project Controls Hub · v0.3 FINAL · DDDC branded · Negative float shown in red as delay indication")
+st.caption("JRD Project Controls Hub · v0.4.1 CLIENT REPORTING · DDDC branded · Negative float shown in red as delay indication")
